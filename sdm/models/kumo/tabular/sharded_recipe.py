@@ -108,9 +108,11 @@ def fit_sharded(
         if prepared.mode == "sharded_cuda"
         else torch.device("cpu")
     )
-    prepared.local_route = _deterministic_route(recipe).to(processing_device)
 
     def process_local() -> tuple[list[TableTensor], list[Any]]:
+        prepared.local_route = _deterministic_route(recipe).to(
+            processing_device
+        )
         on_device = raw.replace_groups(
             [
                 cast(TableTensor, group.to(processing_device))
