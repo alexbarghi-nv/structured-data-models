@@ -9,13 +9,14 @@ __lazy_modules__ = {
     "sdm.models.kumo.timeseries",
 }
 
-from sdm.models.kumo.tabular import KumoTabular
+from sdm.models.kumo.tabular import KumoTabular, DistributedKumoTabular
 from sdm.models.kumo.relational import KumoRelational
 from sdm.models.kumo.timeseries import KumoForecast, KumoAnomaly
 
 
 __all__ = [
     "KumoTabular",
+    "DistributedKumoTabular",
     "KumoRelational",
     "KumoForecast",
     "KumoAnomaly",

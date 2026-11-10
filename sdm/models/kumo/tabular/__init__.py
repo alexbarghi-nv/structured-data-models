@@ -4,6 +4,7 @@
 """KumoTabular."""
 
 from sdm.models.kumo.tabular.model import KumoTabular
+from sdm.models.kumo.tabular.distributed import DistributedKumoTabular
 from sdm.models.kumo.tabular.batching import (
     estimate_fit_batch_size,
     estimate_predict_batch_size,
@@ -12,6 +13,7 @@ from sdm.models.kumo.tabular.batching import (
 
 __all__ = [
     "KumoTabular",
+    "DistributedKumoTabular",
     "estimate_fit_batch_size",
     "estimate_predict_batch_size",
 ]
