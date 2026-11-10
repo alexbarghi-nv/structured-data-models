@@ -24,7 +24,13 @@ def _tensor(shape: tuple[int, ...], offset: float = 0) -> Tensor:
     ).sin()
 
 
-def _reference(q: Tensor, k: Tensor, v: Tensor, lengths: Tensor) -> Tensor:
+def _reference(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    lengths: Tensor,
+    scale: float | None = None,
+) -> Tensor:
     mask = torch.arange(k.size(-3), device=k.device).unsqueeze(
         0
     ) < lengths.unsqueeze(-1)
@@ -34,37 +40,64 @@ def _reference(q: Tensor, k: Tensor, v: Tensor, lengths: Tensor) -> Tensor:
         v.transpose(-3, -2),
         attn_mask=mask[:, None, None, :],
         enable_gqa=q.size(-2) != k.size(-2),
+        scale=scale,
     ).transpose(-3, -2)
 
 
 @pytest.mark.parametrize("heads", [1, 2, 4])
-def test_local_attention(heads: int) -> None:
+@pytest.mark.parametrize("scale", [None, 0.37])
+@pytest.mark.parametrize("length_dtype", [torch.int32, torch.int64])
+def test_local_attention(
+    heads: int, scale: float | None, length_dtype: torch.dtype
+) -> None:
     q = _tensor((2, 5, 4, 8))
     k = _tensor((2, 7, heads, 8), 0.4)
     v = _tensor((2, 7, heads, 6), 0.8)
-    lengths = torch.tensor([0, 5], dtype=torch.int32)
+    lengths = torch.tensor([0, 5], dtype=length_dtype)
     actual = sharded_attention(
         q,
         k,
         v,
         seqused_key_value=lengths,
+        scale=scale,
         query_chunk_size=2,
         key_chunk_size=3,
         batch_chunk_size=1,
     )
     torch.testing.assert_close(
-        actual, _reference(q, k, v, lengths), rtol=1e-5, atol=1e-6
+        actual, _reference(q, k, v, lengths, scale), rtol=1e-5, atol=1e-6
     )
     assert not actual.requires_grad
 
 
-def test_empty_keys() -> None:
-    q = _tensor((2, 5, 4, 8))
-    k = _tensor((2, 0, 2, 8))
-    v = _tensor((2, 0, 2, 6))
+@pytest.mark.parametrize(
+    ("batch", "queries", "keys"), [(2, 5, 0), (2, 0, 7), (0, 5, 7)]
+)
+def test_empty_attention(batch: int, queries: int, keys: int) -> None:
+    q = _tensor((batch, queries, 4, 8))
+    k = _tensor((batch, keys, 2, 8))
+    v = _tensor((batch, keys, 2, 6))
     actual = sharded_attention(q, k, v)
-    assert actual.shape == (2, 5, 4, 6)
+    assert actual.shape == (batch, queries, 4, 6)
     assert torch.count_nonzero(actual) == 0
+
+
+def test_local_attention_broadcast() -> None:
+    q = _tensor((2, 1, 5, 4, 8))
+    k = _tensor((3, 7, 2, 8), 0.4)
+    v = _tensor((3, 7, 2, 6), 0.8)
+    lengths = torch.tensor([[0, 3, 7], [7, 1, 5]], dtype=torch.int32)
+    actual = sharded_attention(q, k, v, seqused_key_value=lengths, scale=0.37)
+    mask = torch.arange(7) < lengths[..., None, None, None]
+    expected = F.scaled_dot_product_attention(
+        q.transpose(-3, -2),
+        k.transpose(-3, -2),
+        v.transpose(-3, -2),
+        attn_mask=mask,
+        enable_gqa=True,
+        scale=0.37,
+    ).transpose(-3, -2)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("shared_keys", [False, True])

@@ -11,7 +11,7 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 
 from sdm.cache import KVCacheEntry
-from sdm.nn import TransformerBlock
+from sdm.nn import SDPA, TransformerBlock
 from sdm.nn.attention import _chunk
 
 
@@ -103,9 +103,25 @@ def sharded_attention(
         raise ValueError("Query head count must be divisible by KV head count")
     groups = q_heads // kv_heads
     value_channels = value.size(-1)
-    out = query.new_zeros((*batch_shape, q_len, q_heads, value_channels))
     if not batch_size or not sum(lengths) or not sum(query_lengths):
-        return out
+        return query.new_zeros((*batch_shape, q_len, q_heads, value_channels))
+    if world_size == 1:
+        mask = None
+        if seqused_key_value is not None:
+            indices = torch.arange(key.size(-3), device=key.device)
+            mask = indices < seqused_key_value[..., None]
+            mask = mask[..., None, None, :]
+        return SDPA(
+            num_query_heads=q_heads,
+            num_key_value_heads=kv_heads,
+            scale=scale,
+        )(
+            query,
+            key,
+            value,
+            attn_mask=mask,
+        )
+    out = query.new_zeros((*batch_shape, q_len, q_heads, value_channels))
 
     query = query.expand(*batch_shape, *query.shape[-3:]).reshape(
         batch_size, q_len, q_heads, channels
