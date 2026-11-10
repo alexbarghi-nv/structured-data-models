@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, cast
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from sdm._memory import chunk_memory_limit
 from sdm.cache import Cache, KVCacheEntry
 from sdm.distributed.attention import distributed_transformer_block
 from sdm.distributed.layout import TableMesh
@@ -116,9 +118,24 @@ class _DistributedKumoTabular(torch.nn.Module):
             .to(dtype)
         )
         out = x.new_empty((*x.shape[:-1], cell.channels), dtype=dtype)
-        rows_per_chunk = max(
-            1, 262144 // max((end - start) * cell.channels, 1)
-        )
+        rows_per_chunk = max(x.size(-3), 1)
+        if x.is_cuda:
+            element_size = out.element_size()
+            # Budget the float32 phases, Fourier features and projections;
+            # the complete output and grouped inputs stay resident.
+            bytes_per_cell = (
+                cell.group_size * cell.num_frequencies * (4 + 2 * element_size)
+                + 2 * cell.channels * element_size
+            )
+            fixed_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in (frequency, weight, bias)
+            )
+            batch_size = math.prod(x.shape[:-3]) * (end - start)
+            memory_limit = chunk_memory_limit(x.device) - fixed_bytes
+            rows_per_chunk = max(
+                1, memory_limit // max(batch_size * bytes_per_cell, 1)
+            )
         for offset in range(0, x.size(-3), rows_per_chunk):
             cell._forward(
                 x[..., offset : offset + rows_per_chunk, :, :],
