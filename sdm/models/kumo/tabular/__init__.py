@@ -3,6 +3,7 @@
 
 """KumoTabular."""
 
+from sdm.models.kumo.tabular.input import ColumnShard
 from sdm.models.kumo.tabular.model import KumoTabular
 from sdm.models.kumo.tabular.distributed import DistributedKumoTabular
 from sdm.models.kumo.tabular.batching import (
@@ -12,6 +13,7 @@ from sdm.models.kumo.tabular.batching import (
 
 
 __all__ = [
+    "ColumnShard",
     "KumoTabular",
     "DistributedKumoTabular",
     "estimate_fit_batch_size",

@@ -15,6 +15,7 @@ from sdm.cache import Cache, KVCacheEntry
 from sdm.distributed.attention import distributed_transformer_block
 from sdm.distributed.layout import TableMesh
 from sdm.models.kumo.tabular.model import _KumoTabular
+from sdm.models.kumo.tabular.partition import PreparedContext
 from sdm.nn import InducedTransformerBlock, TransformerBlock
 
 
@@ -29,6 +30,7 @@ class _DistributedKumoTabular(torch.nn.Module):
         super().__init__()
         self.model = model
         self.mesh = mesh
+        self.prepared: PreparedContext | None = None
         self.attention_options = (
             {} if attention_options is None else attention_options
         )
@@ -48,15 +50,27 @@ class _DistributedKumoTabular(torch.nn.Module):
         if cache is None:
             raise RuntimeError("Use fit() followed by predict()")
         if cache.is_recording:
-            context_rows = x.size(-2)
-            cache["distributed.context_rows"] = context_rows
-            # Compute imputation statistics from the complete context before
-            # partitioning rows; query data must not affect these statistics.
-            mean = x.nanmean(dim=-2, keepdim=True)
-            cache["cell_impute_mean"] = mean.masked_fill(mean.isnan(), 0)
-            row_start, row_end = self.mesh.rows(context_rows)
-            x = x[..., row_start:row_end, :]
-            y_local = y[..., row_start:row_end]
+            if self.prepared is not None:
+                prepared = self.prepared
+                context_rows = prepared.context_rows
+                row_start, _ = self.mesh.rows(context_rows)
+                cache["distributed.context_rows"] = context_rows
+                cache["distributed.feature_count"] = prepared.feature_count
+                cache["distributed.feature_indices"] = (
+                    prepared.feature_indices.to(x.device)
+                )
+                cache["cell_impute_mean"] = prepared.mean.to(x.device)
+                y_local = y
+            else:
+                context_rows = x.size(-2)
+                cache["distributed.context_rows"] = context_rows
+                # Imputation uses the complete context before row partitioning.
+                # Query values must not affect the fitted statistics.
+                mean = x.nanmean(dim=-2, keepdim=True)
+                cache["cell_impute_mean"] = mean.masked_fill(mean.isnan(), 0)
+                row_start, row_end = self.mesh.rows(context_rows)
+                x = x[..., row_start:row_end, :]
+                y_local = y[..., row_start:row_end]
         else:
             context_rows = cast(int, cache["distributed.context_rows"])
             row_start = 0
@@ -72,7 +86,11 @@ class _DistributedKumoTabular(torch.nn.Module):
             rows = rows[
                 ..., start - row_start : end - row_start, :
             ].contiguous()
-            y_local = y[..., start:end]
+            y_local = (
+                y[..., start - row_start : end - row_start]
+                if self.prepared is not None
+                else y[..., start:end]
+            )
         return self._icl(rows, y_local, context_rows, cache)
 
     def _embed_cells(
@@ -85,10 +103,17 @@ class _DistributedKumoTabular(torch.nn.Module):
     ) -> Tensor:
         """Embed only owned positions, retaining global circular groups."""
         cell = self.model.row_embedding.cell_embedding
-        features = x.size(-1)
+        features = cast(
+            int, cache.get("distributed.feature_count", x.size(-1))
+        )
         index = torch.arange(start, end, device=x.device).unsqueeze(-1)
         shifts = 2 ** torch.arange(cell.group_size, device=x.device) - 1
         index = (index + shifts) % features
+        if "distributed.feature_indices" in cache:
+            # Translate global circular groups into the received feature halo.
+            index = torch.searchsorted(
+                cast(Tensor, cache["distributed.feature_indices"]), index
+            )
         impute_mean = cast(Tensor, cache["cell_impute_mean"])[..., index]
         x = x[..., index]
         mask = categorical_mask[..., None, index]
@@ -157,7 +182,9 @@ class _DistributedKumoTabular(torch.nn.Module):
         cache: Cache,
     ) -> Tensor:
         embedding = self.model.row_embedding
-        feature_count = x.size(-1)
+        feature_count = cast(
+            int, cache.get("distributed.feature_count", x.size(-1))
+        )
         feature_start, feature_end = self.mesh.features(feature_count)
         cells = self._embed_cells(
             x, categorical_mask, feature_start, feature_end, cache

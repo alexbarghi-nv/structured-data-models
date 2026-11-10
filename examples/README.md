@@ -9,3 +9,5 @@ This folder contains runnable examples of `structured-data-models`:
 See [`tabular/quickstart.py`](tabular/quickstart.py) for a minimal runnable `structured-data-models` example with `TabICLv2`.
 
 See [`tabular/context_parallel.py`](tabular/context_parallel.py) for collective KumoTabular fit/predict on multiple GPUs with the original preprocessing.
+
+See [`tabular/distributed_preprocessing.py`](tabular/distributed_preprocessing.py) for source-host preprocessing, or [`tabular/distributed_column_shards.py`](tabular/distributed_column_shards.py) for loading per-worker raw column files.
