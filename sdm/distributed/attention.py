@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
+from sdm._memory import chunk_memory_limit
 from sdm.cache import KVCacheEntry
 from sdm.nn import SDPA, TransformerBlock
 from sdm.nn.attention import _chunk
@@ -345,16 +346,57 @@ def distributed_transformer_block(
     batch_shape = torch.broadcast_shapes(*batch_shapes)
     batch_size = math.prod(batch_shape)
     if projection_batch_size == "auto":
+        element_size = (
+            torch.get_autocast_dtype(query.device.type).itemsize
+            if torch.is_autocast_enabled(query.device.type)
+            else query.element_size()
+        )
+        local_key_length = (
+            key_value.key.size(-3)
+            if isinstance(key_value, KVCacheEntry)
+            else query.size(-2)
+            if key_value is None
+            else key_value.size(-2)
+        )
         projection_batch_size = block.auto_batch_size_limit(
             device=query.device,
-            element_size=(
-                torch.get_autocast_dtype(query.device.type).itemsize
-                if torch.is_autocast_enabled(query.device.type)
-                else query.element_size()
-            ),
+            element_size=element_size,
             query_length=query.size(-2),
-            key_value_length=global_key_length,
+            key_value_length=local_key_length,
         )
+        world_size = dist.get_world_size(group) if dist.is_initialized() else 1
+        if query.is_cuda and world_size > 1:
+            projection_bytes = block.peak_bytes_per_example(
+                element_size=element_size,
+                query_length=query.size(-2),
+                key_value_length=local_key_length,
+            )
+            # Explicit float32 score, shifted score and softmax weights may
+            # coexist. Score batches are bounded independently of projections.
+            score_bytes = (
+                3
+                * 4
+                * block.attn.num_query_heads
+                * min(query.size(-2), query_chunk_size)
+                * min(
+                    local_key_length
+                    if replicated_query
+                    else global_key_length,
+                    key_chunk_size,
+                )
+            )
+            memory_limit = chunk_memory_limit(query.device)
+            score_limit = score_bytes * batch_chunk_size
+            if (
+                memory_limit
+                <= (projection_bytes + score_bytes) * batch_chunk_size
+            ):
+                limit = memory_limit // max(projection_bytes + score_bytes, 1)
+            else:
+                limit = (memory_limit - score_limit) // max(
+                    projection_bytes, 1
+                )
+            projection_batch_size = min(projection_batch_size, max(limit, 1))
         if (
             batch_size > 1
             and dist.is_initialized()
