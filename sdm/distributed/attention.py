@@ -106,22 +106,6 @@ def sharded_attention(
     value_channels = value.size(-1)
     if not batch_size or not sum(lengths) or not sum(query_lengths):
         return query.new_zeros((*batch_shape, q_len, q_heads, value_channels))
-    if world_size == 1:
-        mask = None
-        if seqused_key_value is not None:
-            indices = torch.arange(key.size(-3), device=key.device)
-            mask = indices < seqused_key_value[..., None]
-            mask = mask[..., None, None, :]
-        return SDPA(
-            num_query_heads=q_heads,
-            num_key_value_heads=kv_heads,
-            scale=scale,
-        )(
-            query,
-            key,
-            value,
-            attn_mask=mask,
-        )
     out = query.new_zeros((*batch_shape, q_len, q_heads, value_channels))
 
     query = query.expand(*batch_shape, *query.shape[-3:]).reshape(
@@ -141,9 +125,33 @@ def sharded_attention(
     )
     scale = channels**-0.5 if scale is None else scale
 
+    native = (
+        SDPA(
+            num_query_heads=q_heads, num_key_value_heads=kv_heads, scale=scale
+        )
+        if world_size == 1 and key.size(-3) <= key_chunk_size
+        else None
+    )
+
     for batch_start in range(0, batch_size, batch_chunk_size):
         batch_end = min(batch_start + batch_chunk_size, batch_size)
         b = batch_end - batch_start
+        if native is not None:
+            mask = None
+            if valid_lengths is not None:
+                indices = torch.arange(key.size(-3), device=key.device)
+                mask = indices < valid_lengths[batch_start:batch_end, None]
+                mask = mask[:, None, None, :]
+            for query_start in range(0, q_len, query_chunk_size):
+                query_end = min(query_start + query_chunk_size, q_len)
+                query_slice = slice(query_start, query_end)
+                out_flat[batch_start:batch_end, query_slice] = native(
+                    query[batch_start:batch_end, query_start:query_end],
+                    key[batch_start:batch_end],
+                    value[batch_start:batch_end],
+                    attn_mask=mask,
+                )
+            continue
         # [B, Hkv, G, Q, D]; KV heads broadcast across GQA groups.
         q = (
             query[batch_start:batch_end]
