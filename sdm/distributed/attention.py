@@ -311,7 +311,8 @@ def distributed_transformer_block(
     ``projection_batch_size="auto"`` uses the block's native memory budget
     for projection, output and MLP work over independent batch entries. This
     is separate from score chunking. Full output and requested cache storage
-    remain allocated; temporary projection and MLP storage fits one chunk.
+    remain allocated. When returning K/V with a shared broadcast batch, the
+    block runs without projection chunking to retain its original cache shape.
     """
     batch_shapes = [query.shape[:-2]]
     if isinstance(key_value, Tensor):
