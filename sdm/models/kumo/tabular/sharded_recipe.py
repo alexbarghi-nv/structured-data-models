@@ -103,12 +103,12 @@ def fit_sharded(
         )
 
     targets = prepared.source_result(fit_target)
-    prepared.local_route = _deterministic_route(recipe)
     processing_device = (
         prepared.device
         if prepared.mode == "sharded_cuda"
         else torch.device("cpu")
     )
+    prepared.local_route = _deterministic_route(recipe).to(processing_device)
 
     def process_local() -> tuple[list[TableTensor], list[Any]]:
         on_device = raw.replace_groups(
@@ -118,7 +118,6 @@ def fit_sharded(
             ]
         )
         processed = prepared.local_route.fit_transform_ensemble(on_device)
-        prepared.local_route = prepared.local_route.to(processing_device)
         # Materialize owned columns at the host transport boundary.
         local = [
             cast(TableTensor, processed[i].cpu())

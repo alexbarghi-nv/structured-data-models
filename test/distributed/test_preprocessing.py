@@ -49,6 +49,7 @@ def _cases() -> list[
             categories=[torch.arange(60), torch.arange(3)],
         ),
     )
+    batched_mixed = cast(TableTensor, mixed.unsqueeze(0).expand(8, -1, -1))
     categories = TableTensor(
         columns={"categorical": ["a"]},
         categorical=CategoricalTensor(
@@ -79,6 +80,13 @@ def _cases() -> list[
             8,
         ),
         (categories, unseen, torch.arange(3).reshape(-1, 1), 8, 8),
+        (
+            batched_mixed,
+            batched_mixed[:, :3],
+            torch.arange(8 * 67).reshape(8, 67, 1).float().sin(),
+            None,
+            8,
+        ),
         (
             varied,
             varied[:, :2],
