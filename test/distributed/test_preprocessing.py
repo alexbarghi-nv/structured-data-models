@@ -245,6 +245,14 @@ def _lifecycle(
                     layout="mesh",
                     preprocessing=mode,
                 )
+                with pytest.raises(
+                    ValueError, match="does not support 'offload'"
+                ):
+                    model.fit(
+                        x if rank == 0 else None,
+                        y if rank == 0 else None,
+                        offload="cpu",
+                    )
                 with pytest.raises(ValueError, match="context-only"):
                     model.fit(
                         x if rank == 0 else None,
