@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import torch
 import torch.distributed as dist
@@ -41,7 +41,10 @@ class _DistributedKumoTabular(torch.nn.Module):
         categorical_mask: Tensor,
         *,
         cache: Cache | None = None,
+        offload: Literal["cpu"] | None = None,
     ) -> Tensor:
+        if offload is not None:
+            raise ValueError("CPU offload requires single-GPU KumoTabular")
         if cache is None:
             raise RuntimeError("Use fit() followed by predict()")
         if cache.is_recording:
@@ -86,10 +89,8 @@ class _DistributedKumoTabular(torch.nn.Module):
         index = torch.arange(start, end, device=x.device).unsqueeze(-1)
         shifts = 2 ** torch.arange(cell.group_size, device=x.device) - 1
         index = (index + shifts) % features
-        missing = x.isnan()
-        x = torch.where(missing, cast(Tensor, cache["cell_impute_mean"]), x)
+        impute_mean = cast(Tensor, cache["cell_impute_mean"])[..., index]
         x = x[..., index]
-        missing = missing[..., index]
         mask = categorical_mask[..., None, index]
         frequency = torch.where(
             mask.unsqueeze(-1), cell.cat_freq.float(), cell.num_freq.float()
@@ -142,7 +143,7 @@ class _DistributedKumoTabular(torch.nn.Module):
                 frequency,
                 weight,
                 bias,
-                missing=missing[..., offset : offset + rows_per_chunk, :, :],
+                impute_mean=impute_mean,
                 out=out[..., offset : offset + rows_per_chunk, :, :],
             )
         return out

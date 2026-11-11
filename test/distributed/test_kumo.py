@@ -268,6 +268,10 @@ def _public_lifecycle(
                 if task == "classification"
                 else targets.float().sin()
             )
+            with pytest.raises(ValueError, match="does not support 'offload'"):
+                model.fit(x, y, offload="cpu")
+            with pytest.raises(ValueError, match="does not support 'offload'"):
+                model(x, y, query, offload="cpu")
             for context_size in [18, 13]:
                 generator = torch.Generator(device=device).manual_seed(37)
                 reference.fit(

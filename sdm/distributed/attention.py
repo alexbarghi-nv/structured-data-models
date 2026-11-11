@@ -13,7 +13,6 @@ from torch.distributed import ProcessGroup
 from sdm._memory import chunk_memory_limit
 from sdm.cache import KVCacheEntry
 from sdm.nn import SDPA, TransformerBlock
-from sdm.nn.attention import _chunk
 
 
 def _partial_attention(
@@ -605,3 +604,63 @@ def _transformer_block_forward(
     if block.mlp is not None:
         output = output + block.mlp(output)
     return output if cache is None else (output, cache)
+
+
+@overload
+def _chunk(
+    tensor: Tensor,
+    batch_shape: torch.Size,
+    trailing_dims: int,
+    start: int,
+    end: int,
+) -> Tensor: ...
+
+
+@overload
+def _chunk(
+    tensor: KVCacheEntry,
+    batch_shape: torch.Size,
+    trailing_dims: int,
+    start: int,
+    end: int,
+) -> KVCacheEntry: ...
+
+
+@overload
+def _chunk(
+    tensor: None,
+    batch_shape: torch.Size,
+    trailing_dims: int,
+    start: int,
+    end: int,
+) -> None: ...
+
+
+def _chunk(
+    tensor: Tensor | KVCacheEntry | None,
+    batch_shape: torch.Size,
+    trailing_dims: int,
+    start: int,
+    end: int,
+) -> Tensor | KVCacheEntry | None:
+
+    if tensor is None:
+        return None
+
+    if isinstance(tensor, KVCacheEntry):
+        return KVCacheEntry(
+            key=_chunk(tensor.key, batch_shape, 3, start, end),
+            value=_chunk(tensor.value, batch_shape, 3, start, end),
+        )
+
+    trailing_shape = tensor.size()[-trailing_dims:] if trailing_dims else ()
+    tensor = tensor.expand(batch_shape + trailing_shape)
+    if len(batch_shape) == 1:
+        return tensor[start:end]
+
+    flat_index = torch.arange(start, end, device=tensor.device)
+    batch_indices: list[Tensor] = []
+    for size in reversed(batch_shape):
+        batch_indices.append(flat_index % size)
+        flat_index = flat_index // size
+    return tensor[tuple(reversed(batch_indices))]

@@ -3,7 +3,7 @@
 
 from collections.abc import Iterable
 from itertools import chain
-from typing import Any, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 
 import torch
 import torch.distributed as dist
@@ -23,6 +23,7 @@ class DistributedKumoTabular(KumoTabular):
     inputs, recipe and fit options; preprocessing remains the native replicated
     path. Call ``fit`` and ``predict`` collectively, in the same order. Weights
     are replicated and frozen, while context K/V is partitioned across ranks.
+    CPU activation offload is a separate single-GPU :class:`KumoTabular` path.
 
     Args:
         task: Tasks to initialize, as in :class:`KumoTabular`.
@@ -42,6 +43,8 @@ class DistributedKumoTabular(KumoTabular):
             ``"auto"`` uses the original block's memory budget and agrees on
             the minimum limit across the participating ranks.
     """
+
+    supports_offload: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -102,9 +105,11 @@ class DistributedKumoTabular(KumoTabular):
         y: Tensor | TableTensor,
         *args: Any,
         generator: torch.Generator | None = None,
+        offload: Literal["cpu"] | None = None,
         **kwargs: Any,
     ) -> None:
         """Fit with identical recipe random choices on every rank."""
+        self._validate_offload(offload, next(self.parameters()).device)
         if generator is None:
             generator = torch.Generator(device=x.device)
             seed = torch.empty((), dtype=torch.int64, device=x.device)
