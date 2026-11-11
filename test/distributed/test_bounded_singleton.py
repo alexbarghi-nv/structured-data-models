@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Verify singleton attention respects score-memory limits and mask semantics."""
+"""Verify singleton attention score-memory limits and mask semantics."""
 
 import pytest
 import torch
