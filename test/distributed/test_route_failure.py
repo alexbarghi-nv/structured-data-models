@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Two-rank CPU/Gloo tests for synchronized route failures."""
 
 import datetime
@@ -29,6 +32,7 @@ def worker(rank, rendezvous, folder, scenario):
         world_size=2,
         timeout=datetime.timedelta(seconds=12),
     )
+    patcher = pytest.MonkeyPatch()
     try:
         prepared_module.fit_sharded = candidate.fit_sharded
         if scenario == "fault":
@@ -38,8 +42,12 @@ def worker(rank, rendezvous, folder, scenario):
                 def to(self, device):
                     raise RuntimeError("injected route transfer failure")
 
-            candidate._deterministic_route = lambda recipe: (
-                FailingRoute() if rank == 1 else original(recipe)
+            patcher.setattr(
+                candidate,
+                "_deterministic_route",
+                lambda recipe: (
+                    FailingRoute() if rank == 1 else original(recipe)
+                ),
             )
         mesh = TableMesh("mesh", mesh_shape=(1, 2))
         x = TableTensor.from_tensor(
@@ -123,6 +131,7 @@ def worker(rank, rendezvous, folder, scenario):
             }
         Path(folder, f"{scenario}-{rank}.json").write_text(json.dumps(result))
     finally:
+        patcher.undo()
         dist.destroy_process_group()
 
 
