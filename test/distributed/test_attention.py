@@ -160,6 +160,79 @@ def test_projection_batches(shared_keys: bool) -> None:
     torch.testing.assert_close(replay, expected, rtol=1e-5, atol=1e-6)
 
 
+def _check_short_global_keys(
+    device: torch.device, group: ProcessGroup | None, local_rank: int
+) -> None:
+    lengths = torch.tensor([0, 1, 3, 7, 9], dtype=torch.int32, device=device)
+    for heads in (1, 2, 4):
+        q = _tensor((5, 5, 4, 8)).to(device)
+        k = _tensor((5, 7, heads, 8), 0.4).to(device)
+        v = _tensor((5, 7, heads, 6), 0.8).to(device)
+        for scale in (None, 0.37):
+            expected = _reference(q, k, v, lengths, scale)
+            for q_split, k_split in ((2, 3), (0, 0), (5, 7), (0, 7), (5, 0)):
+                qs = (
+                    slice(0, q_split) if local_rank == 0 else slice(q_split, 5)
+                )
+                ks = (
+                    slice(0, k_split) if local_rank == 0 else slice(k_split, 7)
+                )
+                actual = sharded_attention(
+                    q[:, qs],
+                    k[:, ks],
+                    v[:, ks],
+                    group=group,
+                    seqused_key_value=lengths,
+                    scale=scale,
+                    query_chunk_size=2,
+                    key_chunk_size=7,
+                    batch_chunk_size=2,
+                )
+                torch.testing.assert_close(
+                    actual, expected[:, qs], rtol=1e-5, atol=1e-6
+                )
+                assert actual.shape == (5, q[:, qs].size(-3), 4, 6)
+                assert torch.count_nonzero(actual[0]) == 0
+                # FP32 inputs keep FP32 attention arithmetic under autocast.
+                dtype = (
+                    torch.float16 if device.type == "cuda" else torch.bfloat16
+                )
+                with torch.autocast(device.type, dtype=dtype):
+                    autocast = sharded_attention(
+                        q[:, qs],
+                        k[:, ks],
+                        v[:, ks],
+                        group=group,
+                        seqused_key_value=lengths,
+                        scale=scale,
+                        query_chunk_size=2,
+                        key_chunk_size=7,
+                        batch_chunk_size=2,
+                    )
+                torch.testing.assert_close(autocast, actual, rtol=0, atol=0)
+
+    # Final row attention has queries only on the readout owner. Other ranks
+    # still supply KV. Preserve global prefix order across uneven owners.
+    q = _tensor((5, 2, 4, 8)).to(device)
+    k = _tensor((5, 7, 4, 8), 0.4).to(device)
+    v = _tensor((5, 7, 4, 6), 0.8).to(device)
+    qs = slice(None) if local_rank == 0 else slice(0, 0)
+    ks = slice(0, 3) if local_rank == 0 else slice(3, 7)
+    actual = sharded_attention(
+        q[:, qs],
+        k[:, ks],
+        v[:, ks],
+        group=group,
+        seqused_key_value=lengths,
+        query_chunk_size=1,
+        key_chunk_size=7,
+        batch_chunk_size=2,
+    )
+    torch.testing.assert_close(
+        actual, _reference(q, k, v, lengths)[:, qs], rtol=1e-5, atol=1e-6
+    )
+
+
 def _worker(
     rank: int, world: int, rendezvous: str, cuda: bool = False
 ) -> None:
@@ -180,6 +253,7 @@ def _worker(
             groups = [dist.new_group([0, 2]), dist.new_group([1, 3])]
             group = cast(ProcessGroup, groups[rank % 2])
             local_rank = rank // 2
+        _check_short_global_keys(device, group, local_rank)
         q = _tensor((2, 5, 4, 8)).to(device)
         k = _tensor((2, 7, 2, 8), 0.4).to(device)
         v = _tensor((2, 7, 2, 6), 0.8).to(device)

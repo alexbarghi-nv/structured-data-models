@@ -34,6 +34,43 @@ def _partial_attention(
         return maximum, weights.sum(-1), weights @ value.float()
 
 
+def _gather_key_value_tile(
+    key: Tensor,
+    value: Tensor,
+    lengths: list[int],
+    rank: int,
+    group: ProcessGroup | None,
+    batch_start: int,
+    batch_end: int,
+) -> tuple[Tensor, Tensor]:
+    """Assemble one bounded batch tile in group-rank key order."""
+    batch = batch_end - batch_start
+    keys = key.new_empty((batch, sum(lengths), *key.shape[-2:]))
+    values = value.new_empty((batch, sum(lengths), *value.shape[-2:]))
+    offset = 0
+    for source, length in enumerate(lengths):
+        if not length:
+            continue
+        source_rank = (
+            dist.get_global_rank(group, source)
+            if group is not None
+            else source
+        )
+        if rank == source:
+            k = key[batch_start:batch_end].contiguous()
+            v = value[batch_start:batch_end].contiguous()
+        else:
+            k = key.new_empty((batch, length, *key.shape[-2:]))
+            v = value.new_empty((batch, length, *value.shape[-2:]))
+        dist.broadcast(k, src=source_rank, group=group)
+        dist.broadcast(v, src=source_rank, group=group)
+        keys[:, offset : offset + length].copy_(k)
+        values[:, offset : offset + length].copy_(v)
+        offset += length
+        del k, v
+    return keys, values
+
+
 @torch.inference_mode()
 def sharded_attention(
     query: Tensor,
@@ -48,14 +85,16 @@ def sharded_attention(
     key_chunk_size: int = 256,
     batch_chunk_size: int = 16,
 ) -> Tensor:
-    """Attend local queries to all sequence shards without gathering KV.
+    """Attend local queries with bounded distributed KV and score tiles.
 
     All group members must call this function in the same order, with the
     same broadcastable batch shape, head counts, dtypes and chunk sizes.
     Query and key sequence lengths may differ between ranks, including zero.
     Global key order is group-rank order followed by local sequence order.
     Each KV chunk is broadcast once and merged with online softmax statistics
-    in float32. There is no dropout or gradient support.
+    in float32. For non-replicated FP32 queries whose global key length fits
+    one key chunk, native SDPA consumes a gathered KV batch tile instead.
+    There is no dropout or gradient support.
 
     Args:
         query: Local queries of shape ``[..., Q, Hq, D]``.
@@ -132,9 +171,48 @@ def sharded_attention(
         else None
     )
 
+    short_global = (
+        world_size > 1
+        and not replicated_query
+        and sum(lengths) <= key_chunk_size
+        and query.dtype == key.dtype == value.dtype == torch.float32
+    )
+    short_native = (
+        SDPA(
+            num_query_heads=q_heads, num_key_value_heads=kv_heads, scale=scale
+        )
+        if short_global
+        else None
+    )
+
     for batch_start in range(0, batch_size, batch_chunk_size):
         batch_end = min(batch_start + batch_chunk_size, batch_size)
         b = batch_end - batch_start
+        if short_native is not None:
+            # Even ranks with no local queries must supply and receive KV.
+            keys, values = _gather_key_value_tile(
+                key, value, lengths, rank, group, batch_start, batch_end
+            )
+            mask = None
+            if valid_lengths is not None:
+                indices = torch.arange(sum(lengths), device=key.device)
+                mask = indices < valid_lengths[batch_start:batch_end, None]
+                mask = mask[:, None, None, :]
+            for query_start in range(0, q_len, query_chunk_size):
+                query_end = min(query_start + query_chunk_size, q_len)
+                with torch.autocast(query.device.type, enabled=False):
+                    out_flat[batch_start:batch_end, query_start:query_end] = (
+                        short_native(
+                            query[
+                                batch_start:batch_end, query_start:query_end
+                            ],
+                            keys,
+                            values,
+                            attn_mask=mask,
+                        )
+                    )
+            del keys, values
+            continue
         if native is not None:
             mask = None
             if valid_lengths is not None:
@@ -392,6 +470,33 @@ def distributed_transformer_block(
                     key_chunk_size,
                 )
             )
+            if (
+                not replicated_query
+                and global_key_length <= key_chunk_size
+                and element_size == 4
+                and query.dtype == torch.float32
+            ):
+                # Gathered KV plus one owner tile, bounded by global KV size.
+                kv_bytes = (
+                    2
+                    * 4
+                    * global_key_length
+                    * block.attn.num_key_value_heads
+                    * block.attn.head_dim
+                )
+                score_bytes += 2 * kv_bytes
+                if (
+                    block.attn.num_query_heads
+                    != block.attn.num_key_value_heads
+                ):
+                    # MATH GQA may expand both K and V to the query head count.
+                    score_bytes += (
+                        2
+                        * 4
+                        * global_key_length
+                        * block.attn.num_query_heads
+                        * block.attn.head_dim
+                    )
             memory_limit = chunk_memory_limit(query.device)
             score_limit = score_bytes * batch_chunk_size
             if (
