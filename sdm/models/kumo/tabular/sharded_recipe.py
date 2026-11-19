@@ -13,7 +13,13 @@ from torch import Tensor
 import sdm.processing as sp
 from sdm import EnsembleTable, Recipe, Stype, TableTensor
 from sdm.models.kumo.tabular.column_shard import split_inputs
+from sdm.models.kumo.tabular.column_metadata import (
+    column_dictionary,
+    encode_column_metadata,
+    gather_column_metadata,
+)
 from sdm.models.kumo.tabular.input import ColumnShard
+from sdm.models.kumo.tabular.typed_exchange import exchange_member
 from sdm.models.kumo.tabular.partition import (
     PreparedContext,
     halo_indices,
@@ -103,13 +109,24 @@ def fit_sharded(
         )
 
     targets = prepared.source_result(fit_target)
+    # Source-input mode keeps the global schema on rank0. Share the dictionary
+    # once per fit; ordered per-member metadata subsequently travels as IDs.
+    names = (
+        column_dictionary(prepared.raw_columns)
+        if prepared.prepartitioned
+        else prepared.broadcast(
+            column_dictionary(prepared.raw_columns)
+            if prepared.is_source
+            else None
+        )
+    )
     processing_device = (
         prepared.device
         if prepared.mode == "sharded_cuda"
         else torch.device("cpu")
     )
 
-    def process_local() -> tuple[list[TableTensor], list[Any]]:
+    def process_local() -> tuple[list[TableTensor], Tensor]:
         prepared.local_route = _deterministic_route(recipe).to(
             processing_device
         )
@@ -120,10 +137,9 @@ def fit_sharded(
             ]
         )
         processed = prepared.local_route.fit_transform_ensemble(on_device)
-        # Materialize owned columns at the host transport boundary.
+        # Retain processed feature values on their processing device.
         local = [
-            cast(TableTensor, processed[i].cpu())
-            for i in range(len(processed))
+            cast(TableTensor, processed[i]) for i in range(len(processed))
         ]
         # Generated counts can reuse dropped raw numerical names. Fitted route
         # ownership determines the global numerical sign draws.
@@ -160,13 +176,38 @@ def fit_sharded(
                     f"{name}__count" for name in counts._columns
                 )
             metadata.append(
-                (table.columns[Stype.numerical], numeric_names, count_names)
+                (
+                    table.columns[Stype.numerical],
+                    numeric_names,
+                    count_names,
+                    tuple(
+                        name
+                        for name, stype in prepared.local_raw_stypes[
+                            member
+                        ].items()
+                        if stype == Stype.numerical
+                    ),
+                    tuple(
+                        name
+                        for name, stype in prepared.local_raw_stypes[
+                            member
+                        ].items()
+                        if stype == Stype.categorical
+                    ),
+                )
             )
-        return local, metadata
+        # Encode inside local_result so unknown names fail on every rank before
+        # entering the metadata tensor collectives.
+        return local, encode_column_metadata(metadata, names)
 
     local, metadata = prepared.local_result(process_local)
-    gathered: list[Any] = [None] * prepared.mesh.world_size
-    dist.all_gather_object(gathered, metadata, group=prepared.group)
+    use_nccl = dist.get_backend(prepared.mesh.group) == "nccl"
+    gathered = gather_column_metadata(
+        metadata,
+        names,
+        group=prepared.mesh.group if use_nccl else prepared.group,
+        device=prepared.device if use_nccl else torch.device("cpu"),
+    )
 
     def draw_plan() -> tuple[list[Any], list[Any]]:
         numeric_raw = prepared.raw_columns[Stype.numerical]
@@ -284,16 +325,21 @@ def fit_sharded(
     local_targets = prepared.scatter(
         plan_and_targets[1] if prepared.is_source else None
     )
+    prepared.transport_owner_names = tuple(
+        tuple(tuple(owner[member][0]) for owner in gathered)
+        for member in range(len(local))
+    )
     prepared.plans = plans
     prepared.local_signs = []
     signed = []
     for member, table in enumerate(local):
         numeric_names, signs, _chosen = plans[member]
+        signs = signs.to(table.device)
         lookup = {name: index for index, name in enumerate(numeric_names)}
         local_sign = torch.ones(
             (*table.shape[:-2], 1, table.numerical.size(-1)),
             dtype=torch.float64,
-            device="cpu",
+            device=table.device,
         )
         for column, name in enumerate(table.columns[Stype.numerical]):
             if name in lookup:
@@ -304,7 +350,28 @@ def fit_sharded(
                 numerical=(table.numerical * local_sign).float()
             )
         )
-    prepared.members = _exchange(prepared, signed, local_targets, fitting=True)
+    # Raw type lists travel in the same metadata payload. Reuse them for each
+    # member instead of gathering Python type maps inside the exchange loop.
+    input_types = [
+        {
+            name: stype
+            for owner in gathered
+            for names, stype in zip(
+                owner[member][3:],
+                (Stype.numerical, Stype.categorical),
+                strict=True,
+            )
+            for name in names
+        }
+        for member in range(len(local))
+    ]
+    prepared.members = _exchange(
+        prepared,
+        signed,
+        local_targets,
+        fitting=True,
+        input_types=input_types,
+    )
     return prepared.members
 
 
@@ -314,9 +381,9 @@ def _exchange(
     targets: list[TableTensor] | None,
     *,
     fitting: bool,
+    input_types: list[dict[str, Stype]] | None = None,
 ) -> list[Any]:
     mesh = prepared.mesh
-    ranks = dist.get_process_group_ranks(mesh.group)
     results = []
     for member, table in enumerate(local):
         chosen = prepared.plans[member][2]
@@ -324,82 +391,38 @@ def _exchange(
         indices = halo_indices(features, mesh.rank, mesh, prepared.group_size)
         names = tuple(chosen[index] for index in indices.tolist())
         rows = table.size(-2)
-        start, end = mesh.rows(rows) if fitting else (0, rows)
-        data = torch.empty(
-            (*table.shape[:-2], end - start, len(names)), dtype=torch.float32
-        )
-        mean = torch.empty(
-            (*table.shape[:-2], 1, len(names)), dtype=torch.float32
-        )
-        local_names = table.columns[Stype.numerical]
-        lookup = {name: index for index, name in enumerate(local_names)}
-        for global_rank in ranks:
-
-            def partition_owner(
-                table: TableTensor = table,
-                features: int = features,
-                chosen: tuple[str, ...] = chosen,
-                lookup: dict[str, int] = lookup,
-                rows: int = rows,
-            ) -> list[Any]:
-                payloads = []
-                local_mean = table.numerical.nanmean(dim=-2, keepdim=True)
-                local_mean = local_mean.masked_fill(local_mean.isnan(), 0)
-                for destination in range(mesh.world_size):
-                    halo = halo_indices(
-                        features, destination, mesh, prepared.group_size
-                    )
-                    destination_names = [
-                        chosen[index] for index in halo.tolist()
-                    ]
-                    positions = [
-                        i
-                        for i, name in enumerate(destination_names)
-                        if name in lookup
-                    ]
-                    columns = [lookup[destination_names[i]] for i in positions]
-                    row_rank = destination // mesh.feature_parts
-                    left, right = (
-                        mesh.bounds(rows, row_rank, mesh.row_parts)
-                        if fitting
-                        else (0, rows)
-                    )
-                    index = torch.tensor(
-                        columns, dtype=torch.long, device="cpu"
-                    )
-                    payloads.append(
-                        (
-                            positions,
-                            table.numerical[..., left:right, :].index_select(
-                                -1, index
-                            ),
-                            local_mean.index_select(-1, index),
-                        )
-                    )
-                return payloads
-
-            payloads = prepared.source_result(
-                partition_owner, source=global_rank
+        destination_names = [
+            tuple(
+                chosen[index]
+                for index in halo_indices(
+                    features, destination, mesh, prepared.group_size
+                ).tolist()
             )
-            positions, values, means = prepared.scatter(
-                payloads, source=global_rank
+            for destination in range(mesh.world_size)
+        ]
+        row_bounds = [
+            mesh.bounds(
+                rows, destination // mesh.feature_parts, mesh.row_parts
             )
-            data[..., positions] = values
-            mean[..., positions] = means
+            if fitting
+            else (0, rows)
+            for destination in range(mesh.world_size)
+        ]
+        data, mean = exchange_member(
+            prepared,
+            table.numerical,
+            tuple(table.columns[Stype.numerical]),
+            prepared.transport_owner_names[member],
+            destination_names,
+            row_bounds,
+        )
         output = TableTensor.from_tensor(data, columns=names)
         if not fitting:
             results.append(MemberQuery(output, None))
             continue
         assert targets is not None
-        raw_types = prepared.local_raw_stypes[member]
-        # Raw categorical names are gathered as schema metadata only.
-        all_types: list[Any] = [None] * mesh.world_size
-        dist.all_gather_object(all_types, raw_types, group=prepared.group)
-        input_stypes = {
-            name: stype
-            for owner_types in all_types
-            for name, stype in owner_types.items()
-        }
+        assert input_types is not None
+        input_stypes = input_types[member]
         mask = torch.tensor(
             [input_stypes.get(name) == Stype.categorical for name in names],
             dtype=torch.bool,
@@ -446,11 +469,12 @@ def transform_sharded(
         processed = prepared.local_route.transform_ensemble(on_device)
         local = []
         for member in range(len(processed)):
-            table = cast(TableTensor, processed[member].cpu())
+            table = cast(TableTensor, processed[member])
             local.append(
                 table.replace_blocks(
                     numerical=(
-                        table.numerical * prepared.local_signs[member]
+                        table.numerical
+                        * prepared.local_signs[member].to(table.device)
                     ).float()
                 )
             )

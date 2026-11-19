@@ -12,8 +12,9 @@ Run, for example::
 ``rank0_cpu`` fits the recipe once on the source host. ``sharded_cuda`` and
 ``sharded_cpu`` distribute complete raw columns to preprocessing owners before
 fitting the default recipe. All modes send only owned embedding rows, features
-and their circular halo to the model. Gloo transports host shards; NCCL handles
-model attention. Query statistics always reuse the fitted context state.
+and their circular halo to the model. Sharded modes use typed tensors on the
+model communicator (NCCL on CUDA); the legacy rank0_cpu path uses Gloo for host
+transport. Query statistics always reuse the fitted context state.
 """
 
 import argparse

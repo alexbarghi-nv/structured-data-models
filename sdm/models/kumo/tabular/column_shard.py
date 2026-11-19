@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -11,6 +12,7 @@ import torch.distributed as dist
 from torch import Tensor
 
 from sdm import EnsembleTable, Stype, TableTensor
+from sdm.distributed.tensor_control import fingerprint
 from sdm.models.kumo.tabular.input import ColumnShard
 from sdm.processing.execution import _to_ensemble_table
 from sdm.tensor.table import TableSchema
@@ -152,8 +154,21 @@ def _local_inputs(
         }
 
     raw, metadata = prepared.local_result(validate_local)
-    owners: list[Any] = [None] * prepared.mesh.world_size
-    dist.all_gather_object(owners, metadata, group=prepared.group)
+    assert prepared.control is not None
+
+    def encode_owner() -> bytes:
+        report = {
+            key: fingerprint(metadata[key]).hex()
+            for key in ("schema", "rows", "dtype", "members")
+        }
+        report["ids"] = list(metadata["ids"])
+        report["targets"] = metadata["targets"]
+        return json.dumps(report, separators=(",", ":")).encode()
+
+    encoded = prepared.local_result(encode_owner)
+    owners = [
+        json.loads(value) for value in prepared.control.gather_bytes(encoded)
+    ]
     source = owners[0]
     for field, description in (
         ("schema", "global schema"),
@@ -165,7 +180,7 @@ def _local_inputs(
             raise RuntimeError(
                 f"ColumnShard {description} differs between workers"
             )
-    width = sum(len(names) for names in source["schema"].columns.values())
+    width = sum(len(names) for names in metadata["schema"].columns.values())
     ownership = [index for owner in owners for index in owner["ids"]]
     if sorted(ownership) != list(range(width)):
         raise RuntimeError(
@@ -182,8 +197,8 @@ def _local_inputs(
             for owner in owners
         ):
             raise RuntimeError("ColumnShard targets differ between workers")
-        prepared.raw_schema = source["schema"]
-        prepared.raw_columns = source["schema"].columns
+        prepared.raw_schema = metadata["schema"]
+        prepared.raw_columns = metadata["schema"].columns
         prepared.column_ids = shard.column_ids
         prepared.raw_dtype = shard.table.numerical.dtype
     return raw
@@ -198,12 +213,12 @@ def split_inputs(
     y: Tensor | TableTensor | None = None,
 ) -> EnsembleTable:
     """Read owned column shards or scatter complete source-host columns."""
-    shard_flags: list[Any] = [None] * prepared.mesh.world_size
-    dist.all_gather_object(
-        shard_flags, isinstance(x, ColumnShard), group=prepared.group
+    assert prepared.control is not None
+    shard_count = prepared.control.reduce(
+        int(isinstance(x, ColumnShard)), dist.ReduceOp.SUM
     )
-    direct = any(shard_flags)
-    if direct and not all(shard_flags):
+    direct = shard_count != 0
+    if direct and shard_count != prepared.mesh.world_size:
         raise RuntimeError(
             "Every worker must provide a ColumnShard, including empty owners"
         )

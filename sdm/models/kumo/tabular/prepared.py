@@ -14,6 +14,7 @@ from torch.distributed import ProcessGroup
 import sdm.processing as sp
 from sdm import Recipe, Stype, TableTensor
 from sdm.distributed.layout import TableMesh, _get_group
+from sdm.distributed.tensor_control import TensorControl
 from sdm.models.kumo.tabular.input import ColumnShard
 from sdm.models.kumo.tabular.partition import (
     PreparedContext,
@@ -41,9 +42,10 @@ Preprocessing = Literal[
 class PreparedInputs:
     """Fit preprocessing on host/source, then transfer only model-owned shards.
 
-    A shared Gloo group transports CPU tensors; an existing Gloo parent is
-    reused directly. Companion groups belong to the distributed session and
-    are released by the caller's distributed teardown, not by clearing a fit.
+    Sharded modes use typed control and tensor payloads on the mesh backend
+    (NCCL on CUDA, Gloo for CPU sessions). The legacy rank0_cpu recipe path
+    retains its host object transport. Groups belong to the distributed
+    session and are released by the caller's teardown, not by clearing a fit.
     Model inputs contain only owned rows/features and their required halo,
     which can span tiny feature axes.
     Source preprocessing retains complete context tables on the host.
@@ -60,13 +62,22 @@ class PreparedInputs:
         self.mode = mode
         self.device = device
         self.group_size = group_size
-        self.group = cast(
-            ProcessGroup,
-            _get_group(
-                mesh.group,
-                dist.get_process_group_ranks(mesh.group),
-                backend="gloo",
-            ),
+        # rank0_cpu retains its original generic host recipe path. Sharded
+        # preprocessing uses the mesh backend for typed control and payloads.
+        self.control = (
+            None if mode == "rank0_cpu" else TensorControl(mesh.group, device)
+        )
+        self.group = (
+            self.control.group
+            if self.control is not None
+            else cast(
+                ProcessGroup,
+                _get_group(
+                    mesh.group,
+                    dist.get_process_group_ranks(mesh.group),
+                    backend="gloo",
+                ),
+            )
         )
         self.execution: RecipeExecution | None = None
         self.members: list[PreparedContext] = []
@@ -89,7 +100,11 @@ class PreparedInputs:
         return self.mesh.rank == 0
 
     def broadcast(self, value: Any, *, source: int | None = None) -> Any:
-        """Broadcast host metadata without NCCL tensor staging."""
+        """Broadcast control values using the selected preprocessing transport."""
+        if self.control is not None:
+            return self.control.broadcast(
+                value, self.mesh.source if source is None else source
+            )
         objects = [value]
         dist.broadcast_object_list(
             objects,
@@ -101,7 +116,11 @@ class PreparedInputs:
     def scatter(
         self, values: list[Any] | None, *, source: int | None = None
     ) -> Any:
-        """Transfer one destination's host payload to each rank."""
+        """Transfer only each destination's payload to that rank."""
+        if self.control is not None:
+            return self.control.scatter(
+                values, self.mesh.source if source is None else source
+            )
         output: list[Any] = [None]
         dist.scatter_object_list(
             output,
@@ -115,9 +134,13 @@ class PreparedInputs:
         self, operation: Callable[[], _T], *, source: int | None = None
     ) -> _T:
         """Propagate source failures before peers enter transport."""
+        source = self.mesh.source if source is None else source
+        if self.control is not None:
+            return self.control.local_result(
+                lambda: operation() if dist.get_rank() == source else None
+            )
         value = None
         error = None
-        source = self.mesh.source if source is None else source
         if dist.get_rank() == source:
             try:
                 value = operation()
@@ -129,16 +152,33 @@ class PreparedInputs:
         return cast(_T, value)
 
     def local_result(self, operation: Callable[[], _T]) -> _T:
-        """Propagate local failures before entering the next collective."""
+        """Agree on failures with a scalar; gather details only on failure.
+
+        NCCL uses the model device, including for CPU preprocessing. CPU/Gloo
+        sessions use the existing host group. A broken process or CUDA context
+        still requires the process-group timeout and caller's teardown.
+        """
+        if self.control is not None:
+            return self.control.local_result(operation)
+        use_nccl = dist.get_backend(self.mesh.group) == "nccl"
+        status_group = self.mesh.group if use_nccl else self.group
+        status_device = self.device if use_nccl else torch.device("cpu")
+        # Allocate before the callback so an ordinary callback failure does not
+        # require a fresh device allocation to report its status.
+        failed = torch.empty(1, dtype=torch.int32, device=status_device)
         result = None
         error = None
         try:
             result = operation()
         except Exception as exc:  # noqa: BLE001 - synchronize rank failures
             error = f"rank {self.mesh.rank}: {type(exc).__name__}: {exc}"
-        errors: list[Any] = [None] * self.mesh.world_size
-        dist.all_gather_object(errors, error, group=self.group)
-        if any(error is not None for error in errors):
+        failed.fill_(int(error is not None))
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=status_group)
+        # Reading the scalar waits for device completion before branching, so
+        # every rank takes the same error-detail collective path.
+        if failed.item():
+            errors: list[Any] = [None] * self.mesh.world_size
+            dist.all_gather_object(errors, error, group=self.group)
             raise RuntimeError(
                 next(error for error in errors if error is not None)
             )

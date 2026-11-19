@@ -18,6 +18,7 @@ from sdm.models.kumo.tabular.input import ColumnShard
 from sdm.models.kumo.tabular.model import KumoTabular, _KumoTabular
 from sdm.models.kumo.tabular.parallel import _DistributedKumoTabular
 from sdm.models.kumo.tabular.prepared import PreparedInputs, Preprocessing
+from sdm.models.kumo.tabular.sharded_offload import ShardedColumnOffload
 
 
 class DistributedKumoTabular(KumoTabular):
@@ -58,6 +59,9 @@ class DistributedKumoTabular(KumoTabular):
         projection_batch_size: Batch entries per projection/output/MLP chunk.
             ``"auto"`` uses the original block's memory budget and agrees on
             the minimum limit across the participating ranks.
+        sharded_column_offload: Experimental, default-off pure-row storage of
+            one column K/V shard per rank on CPU. Reconstruct on GPU for replay.
+            Requires nonreplicated preprocessing; fitted caches are session-local.
     """
 
     supports_offload: ClassVar[bool] = False
@@ -77,14 +81,18 @@ class DistributedKumoTabular(KumoTabular):
         key_chunk_size: int = 256,
         batch_chunk_size: int = 16,
         projection_batch_size: int | Literal["auto"] = "auto",
+        sharded_column_offload: bool = False,
     ) -> None:
         mesh = TableMesh(layout, process_group, mesh_shape=mesh_shape)
+        if sharded_column_offload and (mesh.feature_parts != 1 or preprocessing == "replicated"):
+            raise ValueError("Sharded column offload requires pure-row distributed preprocessing")
         super().__init__(
             task=task, size=size, pretrained=pretrained, device=device
         )
         self.mesh = mesh
         self.preprocessing = preprocessing
         self._prepared_inputs: PreparedInputs | None = None
+        self._column_offload = ShardedColumnOffload(mesh) if sharded_column_offload else None
         self.requires_grad_(False)
         # Also synchronize random initialization and noncontiguous buffers;
         # inference must use the same parameters on every rank.
@@ -243,7 +251,7 @@ class DistributedKumoTabular(KumoTabular):
             finally:
                 for module in self.models.values():
                     cast(_DistributedKumoTabular, module).prepared = None
-            cache[index] = (
+            cache[index] = self._column_offload.offload(batch_cache, index) if self._column_offload is not None else (
                 batch_cache.to("cpu")
                 if device.type == "cuda" and len(members) > 1
                 else batch_cache
@@ -281,7 +289,10 @@ class DistributedKumoTabular(KumoTabular):
         outputs = []
         for index, query in enumerate(queries):
             stored = cast(Cache, self._cache[index])
-            cache = stored.to(device)
+            cache = (
+                self._column_offload.restore(stored, index, device)
+                if self._column_offload is not None else stored.to(device)
+            )
             output = self._forward(
                 x_context=None,
                 y_context=None,
@@ -303,6 +314,8 @@ class DistributedKumoTabular(KumoTabular):
         """Release fitted context and preprocessing state."""
         super().clear()
         self._prepared_inputs = None
+        if getattr(self, "_column_offload", None) is not None:
+            self._column_offload.clear()
 
     def _synchronize_generator(
         self, device: torch.device, generator: torch.Generator | None
