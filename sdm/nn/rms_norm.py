@@ -15,6 +15,7 @@ class RMSNorm(torch.nn.RMSNorm):
         self,
         x: Tensor,
         rope: RotaryEmbedding | None = None,
+        pos: Tensor | None = None,
     ) -> Tensor:
         """Apply optional rotary embeddings before normalization.
 
@@ -23,6 +24,7 @@ class RMSNorm(torch.nn.RMSNorm):
                 rotary embeddings, where ``S`` is the sequence length,
                 ``H`` is the number of heads, and ``C`` is channels per head.
             rope: Optional rotary embedding applied to the input.
+            pos: Optional global positions for the rotary embedding.
         """
         if (
             x.is_cuda
@@ -43,17 +45,21 @@ class RMSNorm(torch.nn.RMSNorm):
                     and rope.layout == "split_half"
                     and rope.rotary_channels == rope.channels == x.size(-1)
                 ):
-                    seq = torch.arange(
-                        x.size(-3), device=x.device, dtype=torch.float32
+                    seq = (
+                        torch.arange(
+                            x.size(-3), device=x.device, dtype=torch.float32
+                        )
+                        if pos is None
+                        else pos.float()
                     )
-                    freq = seq.view(-1, 1) * rope.inv_freq.view(1, -1)
+                    freq = seq.unsqueeze(-1) * rope.inv_freq
                     cos_sin = (freq.cos().to(x.dtype), freq.sin().to(x.dtype))
                 else:
-                    x = rope(x)
+                    x = rope(x, pos=pos)
             eps = (
                 self.eps
                 if self.eps is not None
                 else torch.finfo(torch.float32).eps
             )
             return rmsnorm_cast(x, self.weight, eps, rope=cos_sin)
-        return super().forward(x if rope is None else rope(x))
+        return super().forward(x if rope is None else rope(x, pos=pos))

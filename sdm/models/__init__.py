@@ -22,6 +22,7 @@ from sdm.models.tabiclv2 import TabICLv2
 from sdm.models.tabfm import TabFM
 from sdm.models.kumo import (
     KumoTabular,
+    DistributedKumoTabular,
     KumoRelational,
     KumoForecast,
     KumoAnomaly,
@@ -39,6 +40,7 @@ __all__ = [
     "TabICLv2",
     "TabFM",
     "KumoTabular",
+    "DistributedKumoTabular",
     "KumoRelational",
     "KumoForecast",
     "KumoAnomaly",
