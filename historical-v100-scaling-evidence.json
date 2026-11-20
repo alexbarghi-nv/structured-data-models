@@ -1,0 +1,66 @@
+{
+  "table": [
+    {
+      "GPUs": 1,
+      "configuration": "Native reference",
+      "fit_seconds": 163.0590424183756,
+      "native_relative_speedup": 1.0,
+      "batch": "historical native"
+    },
+    {
+      "GPUs": 2,
+      "configuration": "Unsharded pipeline",
+      "fit_seconds": 93.4450669605285,
+      "native_relative_speedup": 1.7449721822902893,
+      "batch": "earlier candidate07"
+    },
+    {
+      "GPUs": 4,
+      "configuration": "Unsharded pipeline",
+      "fit_seconds": 55.49743032734841,
+      "native_relative_speedup": 2.9381368012281146,
+      "batch": "earlier candidate07"
+    },
+    {
+      "GPUs": 8,
+      "configuration": "Unsharded pipeline",
+      "fit_seconds": 37.8974145478569,
+      "native_relative_speedup": 4.302642920731821,
+      "batch": "current candidate09 off"
+    },
+    {
+      "GPUs": 8,
+      "configuration": "Sharded cache",
+      "fit_seconds": 27.084380335640162,
+      "native_relative_speedup": 6.020408825961112,
+      "batch": "current candidate09 on"
+    }
+  ],
+  "earlier_raw_hashes": {
+    "results-import-20261112/dgx19-v100-results-export-20261112/evidence/v100-candidate07-scaling24-clean01/results/world2-pair1-07/rank0.json": "1511a496a190e425407ace66aad9771d77a47ab57caafe64632e26ff782acfc2",
+    "results-import-20261112/dgx19-v100-results-export-20261112/evidence/v100-candidate07-scaling24-clean01/results/world2-pair2-07/rank0.json": "26ad8f2a0237ac297cd44c6cc0b8ff733cf14c8a37654bd0ede2bcd25b5d6444",
+    "results-import-20261112/dgx19-v100-results-export-20261112/evidence/v100-candidate07-scaling24-clean01/results/world2-pair3-07/rank0.json": "745065a25b529629e2bc5b92c5a35b70c387ea50eb7dbec3fd8bd99fdfb1ade7",
+    "results-import-20261112/dgx19-v100-results-export-20261112/evidence/v100-candidate07-scaling24-clean01/results/world2-pair4-07/rank0.json": "f02e7116eabaf030f6799094372761866b10828c9a5696f9b5f2550c45de89e8",
+    "results-import-20261112/dgx19-v100-results-export-20261112/evidence/v100-candidate07-scaling24-clean01/results/world4-pair1-07/rank0.json": "908f2a3b29d1e448788a60175ce5c730316dd422115b68100854e9697cd52830",
+    "results-import-20261112/dgx19-v100-results-export-20261112/evidence/v100-candidate07-scaling24-clean01/results/world4-pair2-07/rank0.json": "99126ceafee570788f5f17011985e592f5e3211576f18cac1ef08525fd8afb7f",
+    "results-import-20261112/dgx19-v100-results-export-20261112/evidence/v100-candidate07-scaling24-clean01/results/world4-pair3-07/rank0.json": "b2b693d3a0f043a16016bd352916a632ca90cdf3307df85c878f3bd3089cfd3e",
+    "results-import-20261112/dgx19-v100-results-export-20261112/evidence/v100-candidate07-scaling24-clean01/results/world4-pair4-07/rank0.json": "42a1ac2872dd3aceaeb900c6c9bbd1ffb07cd959f25462fe128bf9b76fa0e690"
+  },
+  "earlier_fit_observations": {
+    "2": [
+      93.375601795502,
+      93.6203437615186,
+      93.09839723724872,
+      93.51453212555498
+    ],
+    "4": [
+      55.432876695878804,
+      55.68786317203194,
+      55.48811799380928,
+      55.50674266088754
+    ]
+  },
+  "current_review_sha256": "6256206bc7a77af20d6361e307fb96a4e4a4059fec165873c80f3f6406855335",
+  "native_evidence_sha256": "caab4ad5242989507d35e85d4ef228741ac872208c265252ae816afb2c3cda75",
+  "scope": "Mixed-date fixed-workload V100 comparison. Native baseline historical; sharded measured only at8; ideal linear reference, not H100 measurement."
+}

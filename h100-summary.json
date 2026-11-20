@@ -1,0 +1,151 @@
+{
+  "status": "PASS",
+  "checks": 110,
+  "arrays": [
+    {
+      "case": "control09-memory",
+      "label": "predict",
+      "mismatches": 0,
+      "max_abs": 0.0,
+      "class_disagreements": 0,
+      "byteidentical": true
+    },
+    {
+      "case": "control09-memory",
+      "label": "predict_repeat",
+      "mismatches": 0,
+      "max_abs": 0.0,
+      "class_disagreements": 0,
+      "byteidentical": true
+    },
+    {
+      "case": "candidate14-memory",
+      "label": "predict",
+      "mismatches": 0,
+      "max_abs": 0.0,
+      "class_disagreements": 0,
+      "byteidentical": true
+    },
+    {
+      "case": "candidate14-memory",
+      "label": "predict_repeat",
+      "mismatches": 0,
+      "max_abs": 0.0,
+      "class_disagreements": 0,
+      "byteidentical": true
+    },
+    {
+      "case": "clean-r1",
+      "label": "predict",
+      "mismatches": 0,
+      "max_abs": 0.0,
+      "class_disagreements": 0,
+      "byteidentical": true
+    },
+    {
+      "case": "clean-r1",
+      "label": "predict_repeat",
+      "mismatches": 0,
+      "max_abs": 0.0,
+      "class_disagreements": 0,
+      "byteidentical": true
+    },
+    {
+      "case": "clean-r2",
+      "label": "predict",
+      "mismatches": 0,
+      "max_abs": 0.0,
+      "class_disagreements": 0,
+      "byteidentical": true
+    },
+    {
+      "case": "clean-r2",
+      "label": "predict_repeat",
+      "mismatches": 0,
+      "max_abs": 0.0,
+      "class_disagreements": 0,
+      "byteidentical": true
+    },
+    {
+      "case": "clean-r3",
+      "label": "predict",
+      "mismatches": 0,
+      "max_abs": 0.0,
+      "class_disagreements": 0,
+      "byteidentical": true
+    },
+    {
+      "case": "clean-r3",
+      "label": "predict_repeat",
+      "mismatches": 0,
+      "max_abs": 0.0,
+      "class_disagreements": 0,
+      "byteidentical": true
+    },
+    {
+      "case": "clean-r4",
+      "label": "predict",
+      "mismatches": 0,
+      "max_abs": 0.0,
+      "class_disagreements": 0,
+      "byteidentical": true
+    },
+    {
+      "case": "clean-r4",
+      "label": "predict_repeat",
+      "mismatches": 0,
+      "max_abs": 0.0,
+      "class_disagreements": 0,
+      "byteidentical": true
+    },
+    {
+      "case": "trace",
+      "label": "predict",
+      "mismatches": 0,
+      "max_abs": 0.0,
+      "class_disagreements": 0,
+      "byteidentical": true
+    },
+    {
+      "case": "trace",
+      "label": "predict_repeat",
+      "mismatches": 0,
+      "max_abs": 0.0,
+      "class_disagreements": 0,
+      "byteidentical": true
+    }
+  ],
+  "clean_seconds": [
+    {
+      "fit": 50.8885014600819,
+      "predict": 3.6110143889673054,
+      "predict_repeat": 3.43022599699907
+    },
+    {
+      "fit": 51.09096445108298,
+      "predict": 3.618157915887423,
+      "predict_repeat": 3.4342314359964803
+    },
+    {
+      "fit": 50.85677378892433,
+      "predict": 3.6020167390815914,
+      "predict_repeat": 3.4516770360060036
+    },
+    {
+      "fit": 51.022425381001085,
+      "predict": 3.6272987310076132,
+      "predict_repeat": 3.432606616988778
+    }
+  ],
+  "median_seconds": {
+    "fit": 50.95546342054149,
+    "predict": 3.614586152427364,
+    "predict_repeat": 3.433419026492629
+  },
+  "trace": {
+    "sha256": "1b6f9873d92e67ab1bfa88e23fa02d98d1938109aab088f83707f49592349cac",
+    "compressed_bytes": 233056667,
+    "events": 8810061
+  },
+  "scope": "Frozen candidate14 distributed1, 10k synthetic on one H100. Control09 correctness; no native or multi-GPU speedup claim."
+}

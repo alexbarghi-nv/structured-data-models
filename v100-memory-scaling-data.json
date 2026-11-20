@@ -1,0 +1,90 @@
+{
+  "1": null,
+  "2": {
+    "fit": {
+      "allocated_peak": 7631317504,
+      "reserved_peak": 10471079936,
+      "allocated_end_live": 1013552128,
+      "reserved_end": 10471079936
+    },
+    "predict": {
+      "allocated_peak": 5542987776,
+      "reserved_peak": 10481565696,
+      "allocated_end_live": 1013552128,
+      "reserved_end": 10481565696
+    },
+    "predict_repeat": {
+      "allocated_peak": 5542987776,
+      "reserved_peak": 10481565696,
+      "allocated_end_live": 1013552128,
+      "reserved_end": 10481565696
+    },
+    "refit_fit": {
+      "allocated_peak": 7630880768,
+      "reserved_peak": 11035213824,
+      "allocated_end_live": 1013115392,
+      "reserved_end": 11035213824
+    },
+    "refit_predict": {
+      "allocated_peak": 5542954496,
+      "reserved_peak": 11037310976,
+      "allocated_end_live": 1013115392,
+      "reserved_end": 11037310976
+    },
+    "refit_predict_repeat": {
+      "allocated_peak": 5542954496,
+      "reserved_peak": 11037310976,
+      "allocated_end_live": 1013115392,
+      "reserved_end": 11037310976
+    },
+    "host": {
+      "cgroup_peak_bytes": 22585139200,
+      "max_gap_seconds": 0.2513180039823055,
+      "samples": 2611
+    }
+  },
+  "4": null,
+  "8": {
+    "fit": {
+      "allocated_peak": 5583863296,
+      "reserved_peak": 7753170944,
+      "allocated_end_live": 901724672,
+      "reserved_end": 7753170944
+    },
+    "predict": {
+      "allocated_peak": 5339763712,
+      "reserved_peak": 9498001408,
+      "allocated_end_live": 901724672,
+      "reserved_end": 9498001408
+    },
+    "predict_repeat": {
+      "allocated_peak": 5339763712,
+      "reserved_peak": 9498001408,
+      "allocated_end_live": 901724672,
+      "reserved_end": 9498001408
+    },
+    "refit_fit": {
+      "allocated_peak": 5584155136,
+      "reserved_peak": 10051649536,
+      "allocated_end_live": 901724672,
+      "reserved_end": 10051649536
+    },
+    "refit_predict": {
+      "allocated_peak": 5339763712,
+      "reserved_peak": 10051649536,
+      "allocated_end_live": 901724672,
+      "reserved_end": 10051649536
+    },
+    "refit_predict_repeat": {
+      "allocated_peak": 5339763712,
+      "reserved_peak": 10051649536,
+      "allocated_end_live": 901724672,
+      "reserved_end": 10051649536
+    },
+    "host": {
+      "cgroup_peak_bytes": 40111468544,
+      "max_gap_seconds": 0.2513322848826647,
+      "samples": 2642
+    }
+  }
+}
