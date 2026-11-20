@@ -37,10 +37,12 @@ The tiled path uses a separate CUDA communication stream with explicit events an
 
 ## Validation scope
 
-The SDK and `pyproject.toml` match all 211 entries of candidate14’s benchmark manifest, SHA256 `98a7202e43766023951f6cccad6df83192d61b51eb5689f9a12de281caf09852`. Measurement scripts, traces and result archives are maintained outside this PR.
+The benchmarked snapshot at commit `a8b30b31399268b2c4168c546477f5db256f1def` matched all 211 entries of candidate14’s manifest, SHA256 `98a7202e43766023951f6cccad6df83192d61b51eb5689f9a12de281caf09852`. This PR also includes a review cleanup that shares the row-pass implementation between fused schedules, clarifies ownership/types and removes duplicate code. The cleanup has separate CPU source-parity checks; GPU correctness and performance still need validation on the cleaned source. The timings below apply to the benchmarked snapshot. Measurement scripts, traces and result archives stay outside this PR.
 
 The accepted DGX19 batch used 10,000 rows, 500 effective features, eight estimators and 512 query rows on eight V100 GPUs. Four balanced fresh-process pairs used equally populated compiled-kernel disk caches without model/KV prefit. Against candidate09, fit improved in all four pairs: median paired reduction 2.465%, with phase medians 25.615s to 24.953s. First and repeat prediction median paired reductions were 10.287% and 7.128%. These are maximum-rank phase timings, not end-to-end runtime or a native-single-GPU scaling result.
 
 All 508 same-world prediction comparisons matched exactly. Historical native comparisons still fail strict equivalence: 43/1024 elements at eight GPUs, maximum absolute difference 8.613e-6, with zero class changes. Two GPUs showed 39/1024 and 6.378e-6. Tolerances remain `atol=1e-6, rtol=1e-5`; class agreement does not replace strict numerical validation.
 
 The newer asynchronous cache-offload experiment is excluded. H100 performance and a fresh complete candidate14 1/2/4/8 scaling matrix are not established by these results.
+
+See [the review guide](candidate14-review.md) for the execution path and invariants.

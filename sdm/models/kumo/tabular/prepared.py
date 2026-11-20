@@ -93,6 +93,9 @@ class PreparedInputs:
         )
         self.plans: list[tuple[tuple[str, ...], Tensor, tuple[str, ...]]] = []
         self.local_signs: list[Tensor] = []
+        self.transport_owner_names: tuple[
+            tuple[tuple[str, ...], ...], ...
+        ] = ()
 
     @property
     def is_source(self) -> bool:
@@ -100,7 +103,7 @@ class PreparedInputs:
         return self.mesh.rank == 0
 
     def broadcast(self, value: Any, *, source: int | None = None) -> Any:
-        """Broadcast control values using the selected preprocessing transport."""
+        """Broadcast control values over the preprocessing transport."""
         if self.control is not None:
             return self.control.broadcast(
                 value, self.mesh.source if source is None else source
@@ -136,8 +139,12 @@ class PreparedInputs:
         """Propagate source failures before peers enter transport."""
         source = self.mesh.source if source is None else source
         if self.control is not None:
-            return self.control.local_result(
-                lambda: operation() if dist.get_rank() == source else None
+            # Only the source consumes the result; peers retain a placeholder.
+            return cast(
+                _T,
+                self.control.local_result(
+                    lambda: operation() if dist.get_rank() == source else None
+                ),
             )
         value = None
         error = None

@@ -157,7 +157,7 @@ def _local_inputs(
     assert prepared.control is not None
 
     def encode_owner() -> bytes:
-        report = {
+        report: dict[str, Any] = {
             key: fingerprint(metadata[key]).hex()
             for key in ("schema", "rows", "dtype", "members")
         }

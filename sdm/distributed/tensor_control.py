@@ -1,4 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+
 """Typed control transport: JSON descriptors and raw tensor storage, no pickle.
 
 Numeric payloads stay on the collective device. Only the small descriptor is
@@ -10,7 +12,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from typing import Any, Callable, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar, cast
 
 import torch
 import torch.distributed as dist
@@ -20,8 +23,8 @@ from torch.distributed import ProcessGroup
 from sdm import (
     CategoricalTensor,
     EnsembleTable,
-    Stype,
     StringTensor,
+    Stype,
     TableTensor,
 )
 from sdm.tensor.table import TableSchema
@@ -98,6 +101,7 @@ def describe(value: Any, leaves: list[Tensor]) -> Any:
 
 
 def restore(node: Any, leaves: list[Tensor]) -> Any:
+    """Rebuild a supported value from its descriptor and tensor leaves."""
     kind = node[0]
     if kind == "scalar":
         return node[1]
@@ -139,6 +143,7 @@ def restore(node: Any, leaves: list[Tensor]) -> Any:
 
 
 def descriptor(value: Any) -> tuple[bytes, list[Tensor]]:
+    """Describe a value while retaining its tensor payloads separately."""
     leaves: list[Tensor] = []
     tree = describe(value, leaves)
     specs = [
@@ -150,6 +155,7 @@ def descriptor(value: Any) -> tuple[bytes, list[Tensor]]:
 
 
 def fingerprint(value: Any) -> bytes:
+    """Hash tensor-free metadata for collective agreement."""
     header, leaves = descriptor(value)
     if leaves:
         raise TypeError(
@@ -159,6 +165,7 @@ def fingerprint(value: Any) -> bytes:
 
 
 def pack(value: Any, device: torch.device) -> Tensor:
+    """Encode aligned descriptors and tensor bytes on the transport device."""
     header, leaves = descriptor(value)
     offset = (8 + len(header) + 15) // 16 * 16
     offsets = []
@@ -183,6 +190,7 @@ def pack(value: Any, device: torch.device) -> Tensor:
 
 
 def unpack(wire: Tensor) -> Any:
+    """Decode a typed payload, reading only descriptor metadata on the host."""
     length = int(wire[:8].view(torch.int64).item())
     tree, specs = json.loads(bytes(wire[8 : 8 + length].cpu().tolist()))
     offset = (8 + length + 15) // 16 * 16
@@ -196,7 +204,9 @@ def unpack(wire: Tensor) -> Any:
 
 
 class TensorControl:
-    def __init__(self, group: ProcessGroup, device: torch.device):
+    """Agree on preprocessing status and exchange typed control payloads."""
+
+    def __init__(self, group: ProcessGroup, device: torch.device) -> None:
         self.group = group
         self.device = (
             device
@@ -209,12 +219,14 @@ class TensorControl:
         self._status = torch.empty(1, dtype=torch.int32, device=self.device)
 
     def check(self) -> None:
+        """Reject further operations after a failed transport."""
         if self.poisoned:
             raise RuntimeError(
                 "Typed transport failed; use a fresh distributed session"
             )
 
     def broadcast_tensor(self, tensor: Tensor, source: int) -> None:
+        """Broadcast a tensor while retaining storage if transport fails."""
         try:
             dist.broadcast(tensor, src=source, group=self.group)
         except BaseException:
@@ -222,7 +234,10 @@ class TensorControl:
             _FAILED_TRANSFERS.append({"broadcast": tensor})
             raise
 
-    def reduce(self, value: int, op: dist.ReduceOp = dist.ReduceOp.MAX) -> int:
+    def reduce(
+        self, value: int, op: dist.ReduceOp.RedOpType = dist.ReduceOp.MAX
+    ) -> int:
+        """Reduce one status integer on the existing communicator."""
         self.check()
         self._status.fill_(value)
         try:
@@ -234,6 +249,7 @@ class TensorControl:
             raise
 
     def gather_bytes(self, value: bytes) -> list[bytes]:
+        """Gather variable-length metadata bytes from each rank."""
         self.check()
         size = torch.tensor(
             [len(value)], dtype=torch.int64, device=self.device
@@ -258,33 +274,35 @@ class TensorControl:
         ]
 
     def local_result(self, operation: Callable[[], _T]) -> _T:
+        """Agree on local operation errors before the next collective."""
         self.check()
         result = None
         error = ""
         try:
             result = operation()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 -- collective error agreement
             error = f"rank {self.rank}: {type(exc).__name__}: {exc}"
         if self.reduce(int(bool(error))):
             errors = self.gather_bytes(error.encode())
             raise RuntimeError(next(e.decode() for e in errors if e))
-        return result
+        return cast(_T, result)
 
     def broadcast(self, value: Any, source: int) -> Any:
+        """Broadcast a supported value from a global source rank."""
         self.check()
         is_source = dist.get_rank() == source
-        wire = self.local_result(
+        encoded = self.local_result(
             lambda: pack(value, self.device) if is_source else None
         )
         size = torch.tensor(
-            [wire.numel() if is_source else 0],
+            [encoded.numel() if encoded is not None else 0],
             dtype=torch.int64,
             device=self.device,
         )
         self.broadcast_tensor(size, source)
         wire = self.local_result(
             lambda: (
-                wire
+                cast(Tensor, encoded)
                 if is_source
                 else torch.empty(
                     int(size.item()), dtype=torch.uint8, device=self.device
@@ -295,6 +313,7 @@ class TensorControl:
         return unpack(wire)
 
     def scatter(self, values: list[Any] | None, source: int) -> Any:
+        """Send one supported value to each communicator rank."""
         self.check()
         is_source = dist.get_rank() == source
 
@@ -344,13 +363,23 @@ class TensorControl:
         receives: list[int],
         sends: list[int],
     ) -> None:
+        """Exchange tensor payloads, retaining ownership on failure."""
         self.check()
         state: dict[str, Any] = {"send": send, "receive": receive}
         try:
-            state["work"] = dist.all_to_all_single(
-                receive, send, receives, sends, group=self.group, async_op=True
+            work = cast(
+                dist.Work,
+                dist.all_to_all_single(
+                    receive,
+                    send,
+                    receives,
+                    sends,
+                    group=self.group,
+                    async_op=True,
+                ),
             )
-            state["work"].wait()
+            state["work"] = work
+            work.wait()
             if send.is_cuda:
                 event = torch.cuda.Event()
                 state["event"] = event

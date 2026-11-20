@@ -5,6 +5,9 @@
 
 import os
 import tempfile
+from contextlib import ExitStack
+from typing import cast
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -16,6 +19,7 @@ from sdm.cache import Cache, KVCacheEntry
 from sdm.distributed.layout import TableMesh
 from sdm.models.kumo.tabular.model import _KumoTabular
 from sdm.models.kumo.tabular.parallel import _DistributedKumoTabular
+from sdm.nn import InducedTransformerBlock
 
 
 def compare_cache(actual, reference):
@@ -75,23 +79,24 @@ def worker(rank, world, path, rows):
             observed = []
             for mode, cache in zip(modes, caches):
                 reads = []
-                originals = []
-                for col in model.row_embedding.col_blocks:
-                    original = col.summarize
-                    originals.append(original)
+                with ExitStack() as patches:
+                    for module in model.row_embedding.col_blocks:
+                        col = cast(InducedTransformerBlock, module)
+                        original = col.summarize
 
-                    def record(
-                        value,
-                        *args,
-                        _original=original,
-                        _reads=reads,
-                        **kwargs,
-                    ):
-                        _reads.append(value.detach().clone())
-                        return _original(value, *args, **kwargs)
+                        def record(
+                            value,
+                            *args,
+                            _original=original,
+                            _reads=reads,
+                            **kwargs,
+                        ):
+                            _reads.append(value.detach().clone())
+                            return _original(value, *args, **kwargs)
 
-                    col.summarize = record
-                try:
+                        patches.enter_context(
+                            patch.object(col, "summarize", record)
+                        )
                     values.append(
                         mode._embed_rows(
                             x[..., start:end, :],
@@ -101,11 +106,6 @@ def worker(rank, world, path, rows):
                             cache,
                         )
                     )
-                finally:
-                    for col, original in zip(
-                        model.row_embedding.col_blocks, originals
-                    ):
-                        col.summarize = original
                 observed.append(reads)
             assert len(observed[0]) == len(observed[1])
             for before, after in zip(*observed):
@@ -116,23 +116,15 @@ def worker(rank, world, path, rows):
             compare_cache(caches[1], caches[0])
             assert torch.equal(x, x_before)
             assert torch.equal(y, y_before)
-            for key in caches[1]:
-                if isinstance(caches[1][key], KVCacheEntry):
-                    assert caches[1][key].key.shape == caches[0][key].key.shape
-                    assert (
-                        caches[1][key].value.shape
-                        == caches[0][key].value.shape
-                    )
-                    assert caches[1][key].key.is_contiguous()
-                    assert caches[1][key].value.is_contiguous()
-                    assert (
-                        caches[1][key].key.stride()
-                        == caches[0][key].key.stride()
-                    )
-                    assert (
-                        caches[1][key].value.stride()
-                        == caches[0][key].value.stride()
-                    )
+            for key, actual in caches[1].items():
+                if isinstance(actual, KVCacheEntry):
+                    expected = cast(KVCacheEntry, caches[0][key])
+                    assert actual.key.shape == expected.key.shape
+                    assert actual.value.shape == expected.value.shape
+                    assert actual.key.is_contiguous()
+                    assert actual.value.is_contiguous()
+                    assert actual.key.stride() == expected.key.stride()
+                    assert actual.value.stride() == expected.value.stride()
             for cache in caches:
                 cache.freeze()
             preserved = {

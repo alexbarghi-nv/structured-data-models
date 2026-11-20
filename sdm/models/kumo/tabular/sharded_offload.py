@@ -3,20 +3,25 @@
 
 """Experimental pure-row column-cache storage; no change to fit arithmetic."""
 
-from sdm.distributed.tensor_control import TensorControl, fingerprint
+from __future__ import annotations
+
+import re
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from math import prod
-import re
+from typing import Any, NoReturn, SupportsIndex, cast
 
 import torch
 import torch.distributed as dist
 
 from sdm.cache import Cache, KVCacheEntry
+from sdm.distributed.layout import TableMesh
+from sdm.distributed.tensor_control import TensorControl, fingerprint
 from sdm.tensor.mixin import DeviceMixin
 
 
-def _dense(shape, stride):
-    """Accept dense permutations, including singleton axes, but not holes/overlap."""
+def _dense(shape: tuple[int, ...], stride: tuple[int, ...]) -> bool:
+    """Accept dense permutations, including singleton axes."""
     if prod(shape) == 0:
         return True
     expected = 1
@@ -30,38 +35,47 @@ def _dense(shape, stride):
 
 @dataclass(frozen=True)
 class ColumnCacheShard(DeviceMixin):
+    """Session-bound CPU ownership of a replicated column-cache slice."""
+
     session: object
     generation: int
     member: int
     rank: int
-    shapes: tuple
-    strides: tuple
-    payloads: tuple
+    shapes: tuple[tuple[int, ...], ...]
+    strides: tuple[tuple[int, ...], ...]
+    payloads: tuple[torch.Tensor, ...]
 
-    def _tensors(self):
+    def _tensors(self) -> Iterator[torch.Tensor]:
         yield from self.payloads
 
-    def _apply_tensor(self, fn):
+    def _apply_tensor(
+        self, fn: Callable[[torch.Tensor], torch.Tensor]
+    ) -> ColumnCacheShard:
         return replace(self, payloads=tuple(fn(t) for t in self.payloads))
 
-    def __reduce_ex__(self, protocol):
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
         raise TypeError(
-            "Sharded column caches are local-session state; fit again after loading"
+            "Sharded column caches are local-session state; "
+            "fit again after loading"
         )
 
 
 class ShardedColumnOffload:
-    """Store balanced physical-storage slices; reconstruct on the current stream.
+    """Store balanced column-cache slices and reconstruct before replay.
 
     Only replicated induced-column K/V is transformed. Full member caches are
     reconstructed before replay, matching the baseline's lifetime. Broadcasts
-    are synchronous API calls, use no new streams and have bounded wire chunks.
-    A failed operation poisons this instance and retains reconstruction buffers.
+    use synchronous API calls, no new streams and bounded wire chunks.
+    A failed operation poisons this instance and retains its buffers.
     """
 
     def __init__(
-        self, mesh, *, chunk_bytes=32 << 20, max_column_bytes=8 << 30
-    ):
+        self,
+        mesh: TableMesh,
+        *,
+        chunk_bytes: int = 32 << 20,
+        max_column_bytes: int = 8 << 30,
+    ) -> None:
         if mesh.feature_parts != 1:
             raise ValueError("Sharded column offload requires a pure-row mesh")
         if chunk_bytes < 16 or max_column_bytes < 0:
@@ -77,18 +91,23 @@ class ShardedColumnOffload:
         self.poisoned = False
         self._inflight = []
 
-    def clear(self):
-        # Invalidates old references; never makes a failed collective reusable.
+    def clear(self) -> None:
+        """Invalidate old shards without resetting a poisoned communicator."""
         self.generation += 1
 
-    def _bounds(self, count, rank):
+    def _bounds(self, count: int, rank: int) -> tuple[int, int]:
         return count * rank // self.world, count * (rank + 1) // self.world
 
-    def _map(self, value, fn, path=()):
+    def _map(
+        self,
+        value: Any,
+        fn: Callable[[Any, tuple[str | int, ...]], Any],
+        path: tuple[str | int, ...] = (),
+    ) -> Any:
         if isinstance(value, Cache):
             result = Cache()
             for key, item in value.items():
-                here = path + (key,)
+                here = (*path, key)
                 if isinstance(key, str) and re.fullmatch(
                     r"row_embedding\.col_block\d+", key
                 ):
@@ -97,16 +116,22 @@ class ShardedColumnOffload:
                     result[key] = self._map(item, fn, here)
             return result.freeze() if value.is_replaying else result
         if isinstance(value, list):
-            return [self._map(x, fn, path + (i,)) for i, x in enumerate(value)]
+            return [self._map(x, fn, (*path, i)) for i, x in enumerate(value)]
         if isinstance(value, tuple) and not isinstance(value, DeviceMixin):
             return tuple(
-                self._map(x, fn, path + (i,)) for i, x in enumerate(value)
+                self._map(x, fn, (*path, i)) for i, x in enumerate(value)
             )
         if isinstance(value, dict):
-            return {k: self._map(x, fn, path + (k,)) for k, x in value.items()}
+            return {k: self._map(x, fn, (*path, k)) for k, x in value.items()}
         return value
 
-    def _validate(self, cache, member, restoring, device=None):
+    def _validate(
+        self,
+        cache: Cache,
+        member: int,
+        restoring: bool,
+        device: torch.device | None = None,
+    ) -> None:
         if self.poisoned:
             raise RuntimeError(
                 "Sharded column offload failed; use a fresh model/session"
@@ -120,6 +145,7 @@ class ShardedColumnOffload:
             if dist.get_rank(self.group) != self.rank:
                 raise RuntimeError("Column-cache rank changed")
             if restoring:
+                device = cast(torch.device, device)
                 backend = str(dist.get_backend(self.group))
                 if backend == "nccl" and device.type != "cuda":
                     raise ValueError(
@@ -196,7 +222,7 @@ class ShardedColumnOffload:
             )
             if total > self.max_column_bytes:
                 raise ValueError("Column cache exceeds reconstruction budget")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 -- collective error agreement
             error = f"{type(exc).__name__}: {exc}"
         # Propagate local descriptor errors before any payload collectives.
         if dist.get_backend(self.group) == "nccl":
@@ -238,7 +264,8 @@ class ShardedColumnOffload:
                 "Column-cache metadata/order differs across ranks"
             )
 
-    def offload(self, cache, member):
+    def offload(self, cache: Cache, member: int) -> Cache:
+        """Copy only the owned column K/V slices to CPU storage."""
         try:
             self._validate(cache, member, False)
 
@@ -266,7 +293,10 @@ class ShardedColumnOffload:
             self.poisoned = True
             raise
 
-    def restore(self, cache, member, device):
+    def restore(
+        self, cache: Cache, member: int, device: torch.device | str
+    ) -> Cache:
+        """Reconstruct complete column K/V on the model device for replay."""
         try:
             device = torch.device(device)
             self._validate(cache, member, True, device)

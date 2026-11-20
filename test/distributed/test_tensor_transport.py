@@ -7,6 +7,7 @@ import os
 import tempfile
 from datetime import timedelta
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 import pyarrow as pa
@@ -84,6 +85,7 @@ def worker(rank, world, path, backend, subgroup, model):
             )
             if rank not in (1, 3):
                 return
+        group = cast(dist.ProcessGroup, group)
         size = dist.get_world_size(group)
         local = dist.get_rank(group)
         mesh = TableMesh("mesh", group=group, mesh_shape=(size, 1))
@@ -187,8 +189,8 @@ def worker(rank, world, path, backend, subgroup, model):
             stored = owner.offload(cache, 0)
             restored = owner.restore(stored, 0, device)
             assert torch.equal(
-                restored["row_embedding.col_block0"].key,
-                cache["row_embedding.col_block0"].key,
+                cast(KVCacheEntry, restored["row_embedding.col_block0"]).key,
+                cast(KVCacheEntry, cache["row_embedding.col_block0"]).key,
             )
             bad_owner = ShardedColumnOffload(mesh)
             bad_cache = Cache(
@@ -257,86 +259,92 @@ def worker(rank, world, path, backend, subgroup, model):
             for task in ["regression", "classification"]:
                 outputs = []
                 for implementation in [baseline, candidate]:
-                    prepared_module.fit_sharded = implementation
-                    prepared_module.transform_sharded = (
-                        implementation.__globals__["transform_sharded"]
-                    )
-                    PreparedInputs.broadcast = (
-                        broadcast
-                        if implementation is candidate
-                        else (
-                            lambda self, *a, **kw: host_value(
+                    with (
+                        patch.object(
+                            prepared_module, "fit_sharded", implementation
+                        ),
+                        patch.object(
+                            prepared_module,
+                            "transform_sharded",
+                            implementation.__globals__["transform_sharded"],
+                        ),
+                        patch.object(
+                            PreparedInputs,
+                            "broadcast",
+                            broadcast
+                            if implementation is candidate
+                            else lambda self, *a, **kw: host_value(
                                 broadcast(self, *a, **kw)
-                            )
-                        )
-                    )
-                    PreparedInputs.scatter = (
-                        scatter
-                        if implementation is candidate
-                        else (
-                            lambda self, *a, **kw: host_value(
+                            ),
+                        ),
+                        patch.object(
+                            PreparedInputs,
+                            "scatter",
+                            scatter
+                            if implementation is candidate
+                            else lambda self, *a, **kw: host_value(
                                 scatter(self, *a, **kw)
+                            ),
+                        ),
+                    ):
+                        torch.manual_seed(42)
+                        m = DistributedKumoTabular(
+                            task=task,
+                            size="small",
+                            pretrained=False,
+                            device=device,
+                            layout="mesh",
+                            mesh_shape=(size, 1),
+                            preprocessing="sharded_cuda"
+                            if backend == "nccl"
+                            else "sharded_cpu",
+                            sharded_column_offload=True,
+                        )
+                        # Constructor uses WORLD; lifecycle cases run on WORLD
+                        # only.
+                        guards = []
+                        if implementation is candidate:
+                            for name in [
+                                "all_gather_object",
+                                "broadcast_object_list",
+                                "scatter_object_list",
+                            ]:
+                                guard = patch.object(dist, name, forbidden)
+                                guard.start()
+                                guards.append(guard)
+                        try:
+                            y = torch.arange(19).view(-1, 1)
+                            y = (
+                                y % 3
+                                if task == "classification"
+                                else y.float().sin()
                             )
-                        )
-                    )
-                    torch.manual_seed(42)
-                    m = DistributedKumoTabular(
-                        task=task,
-                        size="small",
-                        pretrained=False,
-                        device=device,
-                        layout="mesh",
-                        mesh_shape=(size, 1),
-                        preprocessing="sharded_cuda"
-                        if backend == "nccl"
-                        else "sharded_cpu",
-                        sharded_column_offload=True,
-                    )
-                    # Constructor uses WORLD; lifecycle cases run on WORLD
-                    # only.
-                    guards = []
-                    if implementation is candidate:
-                        for name in [
-                            "all_gather_object",
-                            "broadcast_object_list",
-                            "scatter_object_list",
-                        ]:
-                            guard = patch.object(dist, name, forbidden)
-                            guard.start()
-                            guards.append(guard)
-                    try:
-                        y = torch.arange(19).view(-1, 1)
-                        y = (
-                            y % 3
-                            if task == "classification"
-                            else y.float().sin()
-                        )
-                        m.fit(
-                            x if rank == 0 else None,
-                            y if rank == 0 else None,
-                            num_estimators=2,
-                            generator=torch.Generator(
-                                device=device
-                            ).manual_seed(37),
-                        )
-                        first = (
-                            m.predict(query if rank == 0 else None)
-                            .numerical.cpu()
-                            .clone()
-                        )
-                        repeat = (
-                            m.predict(query if rank == 0 else None)
-                            .numerical.cpu()
-                            .clone()
-                        )
-                        torch.testing.assert_close(
-                            first, repeat, atol=0, rtol=0
-                        )
-                        outputs.append(first)
-                        m.clear()
-                    finally:
-                        for guard in reversed(guards):
-                            guard.stop()
+                            m.fit(
+                                x if rank == 0 else None,
+                                y if rank == 0 else None,
+                                num_estimators=2,
+                                generator=torch.Generator(
+                                    device=device
+                                ).manual_seed(37),
+                            )
+                            first = (
+                                m.predict(query if rank == 0 else None)
+                                .numerical.cpu()
+                                .clone()
+                            )
+                            repeat = (
+                                m.predict(query if rank == 0 else None)
+                                .numerical.cpu()
+                                .clone()
+                            )
+                            torch.testing.assert_close(
+                                first, repeat, atol=0, rtol=0
+                            )
+                            outputs.append(first)
+                            m.clear()
+                        finally:
+                            for guard in reversed(guards):
+                                guard.stop()
                 torch.testing.assert_close(
                     outputs[0], outputs[1], atol=1e-6, rtol=1e-5
                 )

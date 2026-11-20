@@ -2,18 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
 
 from sdm.cache import Cache
+from sdm.distributed._summary_merge import OneTicketQueue
+from sdm.distributed.layout import TableMesh
+from sdm.models.kumo.tabular.model import _KumoTabular
 from sdm.models.kumo.tabular.parallel import _DistributedKumoTabular
 
 
 def test_guards_and_replay_before_mutation(monkeypatch):
     model = _DistributedKumoTabular(
-        SimpleNamespace(row_embedding=SimpleNamespace()),
-        SimpleNamespace(feature_parts=1, features=lambda n: (0, n)),
+        cast(_KumoTabular, SimpleNamespace(row_embedding=SimpleNamespace())),
+        cast(
+            TableMesh,
+            SimpleNamespace(feature_parts=1, features=lambda n: (0, n)),
+        ),
     )
     assert model._fused_column_pipeline is False
     model._fused_pure_row = True
@@ -56,19 +63,26 @@ def test_guards_and_replay_before_mutation(monkeypatch):
 
 def test_failure_poison_retains_live_queue(monkeypatch):
     model = _DistributedKumoTabular(
-        SimpleNamespace(row_embedding=SimpleNamespace()),
-        SimpleNamespace(feature_parts=1),
+        cast(_KumoTabular, SimpleNamespace(row_embedding=SimpleNamespace())),
+        cast(TableMesh, SimpleNamespace(feature_parts=1)),
     )
     ticket = object()
-    queue = SimpleNamespace(poisoned=False, ticket=ticket)
+    queue = OneTicketQueue()
+    queue.ticket = ticket
 
-    def fail(*args):
+    def fail(*args, **kwargs):
         model._fused_async_queue = queue
         raise ValueError("column failure")
 
-    monkeypatch.setattr(model, "_embed_rows_fused_column_pipeline_impl", fail)
+    monkeypatch.setattr(model, "_embed_rows_fused_impl", fail)
     with pytest.raises(ValueError, match="column failure"):
-        model._embed_rows_fused_column_pipeline(None, None, None, 1, None)
+        model._embed_rows_fused_column_pipeline(
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0, dtype=torch.bool),
+            1,
+            Cache(),
+        )
     assert model._fused_async_queue is queue
     assert queue.ticket is ticket
     assert queue.poisoned is True

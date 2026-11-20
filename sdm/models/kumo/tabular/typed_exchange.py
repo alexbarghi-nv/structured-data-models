@@ -1,5 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""One bounded per-estimator typed exchange; no host feature materialization."""
+
+"""Typed per-estimator feature exchange without host materialization."""
 
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ def exchange_member(
     destination_names: list[tuple[str, ...]],
     row_bounds: list[tuple[int, int]],
 ) -> tuple[Tensor, Tensor]:
+    """Redistribute one estimator's owned features and context means."""
     control = prepared.control
     assert control is not None
     control.check()

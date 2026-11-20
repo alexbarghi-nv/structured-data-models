@@ -34,7 +34,7 @@ def column_dictionary(
 def encode_column_metadata(
     metadata: ColumnMetadata, names: tuple[str, ...]
 ) -> Tensor:
-    """Pack member/list lengths and ordered IDs; retain duplicates for validation."""
+    """Pack member lengths and ordered IDs, retaining duplicates."""
     ids = {name: index for index, name in enumerate(names)}
     packed = [len(metadata)]
     for member in metadata:
@@ -48,7 +48,7 @@ def encode_column_metadata(
 def decode_column_metadata(
     packed: list[int], names: tuple[str, ...]
 ) -> ColumnMetadata:
-    """Restore ordered per-member name lists without changing field boundaries."""
+    """Restore ordered column names and member field boundaries."""
     result = []
     offset = 1
     for _ in range(packed[0]):
@@ -75,7 +75,7 @@ def gather_column_metadata(
     group: ProcessGroup,
     device: torch.device,
 ) -> list[ColumnMetadata]:
-    """Gather variable-sized int64 metadata, with CPU/Gloo or CUDA/NCCL transport.
+    """Gather int64 metadata over the existing CPU/Gloo or CUDA/NCCL group.
 
     The caller has agreed on the dictionary and caught encoding failures before
     entry. Temporary storage is O(world_size * largest encoded rank payload).

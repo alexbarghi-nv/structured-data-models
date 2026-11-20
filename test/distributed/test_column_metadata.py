@@ -9,6 +9,8 @@ import os
 import tempfile
 from datetime import timedelta
 from pathlib import Path
+from typing import cast
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -19,6 +21,7 @@ import sdm.models.kumo.tabular.prepared as prepared_module
 from sdm import CategoricalTensor, EnsembleTable, Stype, TableTensor
 from sdm.distributed.layout import TableMesh
 from sdm.models.kumo.tabular.column_metadata import (
+    ColumnMetadata,
     column_dictionary,
     decode_column_metadata,
     encode_column_metadata,
@@ -36,7 +39,7 @@ def test_dictionary_and_codec():
     }
     names = column_dictionary(schema)
     assert names == tuple(sorted({"z", "a__count", "é", "a", "é__count"}))
-    metadata = [
+    metadata: ColumnMetadata = [
         (("z", "a", "z", "a__count"), ("z",), ("a__count",)),
         ((), (), ()),
     ]
@@ -56,6 +59,7 @@ def legacy_fit():
         "baseline_sharded_recipe", str(path)
     )
     spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module.fit_sharded
@@ -177,11 +181,12 @@ def worker(rank, world, path, backend, subgroup, integration, direct):
             )
             if rank not in (1, 3):
                 return
+        group = cast(dist.ProcessGroup, group)
         local_rank = dist.get_rank(group)
         size = dist.get_world_size(group)
         names = ("a", "b", "z", "é")
 
-        def metadata_for(i):
+        def metadata_for(i: int) -> ColumnMetadata:
             return [
                 (tuple(names[: i % 4]), ("z",) * i, ()),
                 (("é", "a"), (), ()),
@@ -220,52 +225,62 @@ def worker(rank, world, path, backend, subgroup, integration, direct):
             for x, y, estimators in cases():
                 snapshots = []
                 for implementation in [baseline, candidate]:
-                    prepared_module.fit_sharded = implementation
-                    prepared_module.transform_sharded = (
-                        implementation.__globals__["transform_sharded"]
-                    )
-                    PreparedInputs.broadcast = (
-                        broadcast
-                        if implementation is candidate
-                        else (
-                            lambda self, *a, **kw: host_value(
+                    with (
+                        patch.object(
+                            prepared_module, "fit_sharded", implementation
+                        ),
+                        patch.object(
+                            prepared_module,
+                            "transform_sharded",
+                            implementation.__globals__["transform_sharded"],
+                        ),
+                        patch.object(
+                            PreparedInputs,
+                            "broadcast",
+                            broadcast
+                            if implementation is candidate
+                            else lambda self, *a, **kw: host_value(
                                 broadcast(self, *a, **kw)
-                            )
-                        )
-                    )
-                    PreparedInputs.scatter = (
-                        scatter
-                        if implementation is candidate
-                        else (
-                            lambda self, *a, **kw: host_value(
+                            ),
+                        ),
+                        patch.object(
+                            PreparedInputs,
+                            "scatter",
+                            scatter
+                            if implementation is candidate
+                            else lambda self, *a, **kw: host_value(
                                 scatter(self, *a, **kw)
-                            )
+                            ),
+                        ),
+                    ):
+                        prepared = PreparedInputs(
+                            mesh, "sharded_cpu", device, 3
                         )
-                    )
-                    prepared = PreparedInputs(mesh, "sharded_cpu", device, 3)
-                    generator = torch.Generator(device=device).manual_seed(37)
-                    fit_x = (
-                        make_shard(x, mesh)
-                        if direct
-                        else (x if local_rank == 0 else None)
-                    )
-                    query = x[..., :3, :]
-                    query_x = (
-                        make_shard(query, mesh)
-                        if direct
-                        else (query if local_rank == 0 else None)
-                    )
-                    contexts = prepared.fit(
-                        fit_x,
-                        y if local_rank == 0 else None,
-                        default_recipe(),
-                        estimators,
-                        generator,
-                    )
-                    queries = prepared.transform(query_x)
-                    snapshots.append(
-                        snapshot(contexts, queries, prepared, generator)
-                    )
+                        generator = torch.Generator(device=device).manual_seed(
+                            37
+                        )
+                        fit_x = (
+                            make_shard(x, mesh)
+                            if direct
+                            else (x if local_rank == 0 else None)
+                        )
+                        query = x[..., :3, :]
+                        query_x = (
+                            make_shard(query, mesh)
+                            if direct
+                            else (query if local_rank == 0 else None)
+                        )
+                        contexts = prepared.fit(
+                            fit_x,
+                            y if local_rank == 0 else None,
+                            default_recipe(),
+                            estimators,
+                            generator,
+                        )
+                        queries = prepared.transform(query_x)
+                        snapshots.append(
+                            snapshot(contexts, queries, prepared, generator)
+                        )
                 left, right = snapshots
                 assert left[1] == right[1]
                 for a, b in zip(left[0], right[0], strict=True):

@@ -51,8 +51,9 @@ class DistributedKumoTabular(KumoTabular):
             halos transfer to model devices. All learned state uses context
             rows only. Nonreplicated modes run estimators individually and
             offload fitted caches to CPU when there is more than one.
-            They require Gloo transport and do not support callbacks or related
-            tables; use the replicated path for those capabilities.
+            Sharded modes use typed transport on the model communicator;
+            rank0_cpu uses Gloo. Callbacks and related tables
+            require the replicated path.
         query_chunk_size: Queries per attention score tile.
         key_chunk_size: Keys per attention score and K/V broadcast tile.
         batch_chunk_size: Flattened batch entries per attention tile.
@@ -60,8 +61,8 @@ class DistributedKumoTabular(KumoTabular):
             ``"auto"`` uses the original block's memory budget and agrees on
             the minimum limit across the participating ranks.
         sharded_column_offload: Experimental, default-off pure-row storage of
-            one column K/V shard per rank on CPU. Reconstruct on GPU for replay.
-            Requires nonreplicated preprocessing; fitted caches are session-local.
+            one column K/V shard per rank on CPU for GPU reconstruction.
+            Requires nonreplicated preprocessing and session-local caches.
     """
 
     supports_offload: ClassVar[bool] = False
@@ -84,15 +85,22 @@ class DistributedKumoTabular(KumoTabular):
         sharded_column_offload: bool = False,
     ) -> None:
         mesh = TableMesh(layout, process_group, mesh_shape=mesh_shape)
-        if sharded_column_offload and (mesh.feature_parts != 1 or preprocessing == "replicated"):
-            raise ValueError("Sharded column offload requires pure-row distributed preprocessing")
+        if sharded_column_offload and (
+            mesh.feature_parts != 1 or preprocessing == "replicated"
+        ):
+            raise ValueError(
+                "Sharded column offload requires pure-row "
+                "distributed preprocessing"
+            )
         super().__init__(
             task=task, size=size, pretrained=pretrained, device=device
         )
         self.mesh = mesh
         self.preprocessing = preprocessing
         self._prepared_inputs: PreparedInputs | None = None
-        self._column_offload = ShardedColumnOffload(mesh) if sharded_column_offload else None
+        self._column_offload = (
+            ShardedColumnOffload(mesh) if sharded_column_offload else None
+        )
         self.requires_grad_(False)
         # Also synchronize random initialization and noncontiguous buffers;
         # inference must use the same parameters on every rank.
@@ -251,10 +259,14 @@ class DistributedKumoTabular(KumoTabular):
             finally:
                 for module in self.models.values():
                     cast(_DistributedKumoTabular, module).prepared = None
-            cache[index] = self._column_offload.offload(batch_cache, index) if self._column_offload is not None else (
-                batch_cache.to("cpu")
-                if device.type == "cuda" and len(members) > 1
-                else batch_cache
+            cache[index] = (
+                self._column_offload.offload(batch_cache, index)
+                if self._column_offload is not None
+                else (
+                    batch_cache.to("cpu")
+                    if device.type == "cuda" and len(members) > 1
+                    else batch_cache
+                )
             )
         self._cache = cache.freeze()
         self._prepared_inputs = prepared
@@ -291,7 +303,8 @@ class DistributedKumoTabular(KumoTabular):
             stored = cast(Cache, self._cache[index])
             cache = (
                 self._column_offload.restore(stored, index, device)
-                if self._column_offload is not None else stored.to(device)
+                if self._column_offload is not None
+                else stored.to(device)
             )
             output = self._forward(
                 x_context=None,
@@ -314,8 +327,9 @@ class DistributedKumoTabular(KumoTabular):
         """Release fitted context and preprocessing state."""
         super().clear()
         self._prepared_inputs = None
-        if getattr(self, "_column_offload", None) is not None:
-            self._column_offload.clear()
+        column_offload = getattr(self, "_column_offload", None)
+        if column_offload is not None:
+            column_offload.clear()
 
     def _synchronize_generator(
         self, device: torch.device, generator: torch.Generator | None

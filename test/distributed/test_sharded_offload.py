@@ -8,6 +8,7 @@ import pickle
 import tempfile
 from dataclasses import replace
 from datetime import timedelta
+from typing import cast
 
 import pytest
 import torch
@@ -72,7 +73,9 @@ def storage_worker(rank, world, path):
         cache.freeze()
         original_size = cache.size()
         stored = owner.offload(cache, 2)
-        shard = stored["nested"][0]["row_embedding.col_block0"]
+        shard = cast(list[Cache], stored["nested"])[0][
+            "row_embedding.col_block0"
+        ]
         assert isinstance(shard, ColumnCacheShard)
         assert stored.is_replaying
         expected = sum(
@@ -83,12 +86,17 @@ def storage_worker(rank, world, path):
         actual = sum(t.numel() * t.element_size() for t in shard.payloads)
         actual += sum(
             t.numel() * t.element_size()
-            for t in stored["row_embedding.col_block1"].payloads
+            for t in cast(
+                ColumnCacheShard, stored["row_embedding.col_block1"]
+            ).payloads
         )
         assert actual == expected
         # Physical host allocations own only their shard, not a view of the
         # full cache.
-        for s in [shard, stored["row_embedding.col_block1"]]:
+        for s in [
+            shard,
+            cast(ColumnCacheShard, stored["row_embedding.col_block1"]),
+        ]:
             for t in s.payloads:
                 assert (
                     t.untyped_storage().nbytes()
@@ -100,19 +108,29 @@ def storage_worker(rank, world, path):
         assert sum(counts) == original_size - 24
         for _ in range(2):
             restored = owner.restore(stored.cpu(), 2, "cpu")
-            entry = restored["nested"][0]["row_embedding.col_block0"]
+            entry = cast(
+                KVCacheEntry,
+                cast(list[Cache], restored["nested"])[0][
+                    "row_embedding.col_block0"
+                ],
+            )
             for a, b in zip(entry, (k, v)):
                 assert torch.equal(a, b)
                 assert a.stride() == b.stride()
             assert torch.equal(
-                restored["icl_block.layer0"].key, torch.ones(3) * rank
+                cast(KVCacheEntry, restored["icl_block.layer0"]).key,
+                torch.ones(3) * rank,
             )
             assert torch.equal(
-                restored["icl_block.layer0"].value, torch.ones(3) * (rank + 1)
+                cast(KVCacheEntry, restored["icl_block.layer0"]).value,
+                torch.ones(3) * (rank + 1),
             )
             assert restored.is_replaying
             assert not owner._inflight
-        assert cache["nested"][0]["row_embedding.col_block0"].key is k
+        nested = cast(list[Cache], cache["nested"])
+        assert (
+            cast(KVCacheEntry, nested[0]["row_embedding.col_block0"]).key is k
+        )
         assert cache.size() == original_size
         with pytest.raises(TypeError, match="local-session"):
             pickle.dumps(stored)
@@ -251,7 +269,9 @@ def model_worker(rank, world, path, rows):
                 restored = owner.restore(stored, 0, "cpu")
                 for key, entry in cache.items():
                     if isinstance(entry, KVCacheEntry):
-                        for a, b in zip(restored[key], entry):
+                        for a, b in zip(
+                            cast(KVCacheEntry, restored[key]), entry
+                        ):
                             assert torch.equal(a, b)
                             assert a.stride() == b.stride()
                 result = predict(restored)

@@ -1,23 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Stable merge of completed normalized attention summaries.
 
-Experimental helper; not wired into the model. All ranks must provide matching
-shapes, using (-inf LSE, zero output) for an empty local shard.
+Used by the tiled column pipeline. All ranks provide matching shapes, using
+(-inf LSE, zero output) for an empty local shard.
 """
+
 import torch
 import torch.distributed as dist
 from torch import Tensor
 
 
-def merge_summary(out: Tensor, lse: Tensor, group=None) -> tuple[Tensor, Tensor]:
+def merge_summary(
+    out: Tensor, lse: Tensor, group=None
+) -> tuple[Tensor, Tensor]:
     maximum = lse.float().clone(memory_format=torch.contiguous_format)
     dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=group)
     safe_max = maximum.masked_fill(maximum.isneginf(), 0)
     weight = (lse.float() - safe_max).exp().contiguous()
-    numerator = (torch.where(weight.unsqueeze(-1) > 0, out.float(), 0) * weight.unsqueeze(-1)).contiguous()
+    numerator = (
+        torch.where(weight.unsqueeze(-1) > 0, out.float(), 0)
+        * weight.unsqueeze(-1)
+    ).contiguous()
     dist.all_reduce(weight, op=dist.ReduceOp.SUM, group=group)
     dist.all_reduce(numerator, op=dist.ReduceOp.SUM, group=group)
     valid = weight > 0
-    result = numerator / weight.clamp_min(torch.finfo(weight.dtype).tiny).unsqueeze(-1)
+    result = numerator / weight.clamp_min(
+        torch.finfo(weight.dtype).tiny
+    ).unsqueeze(-1)
     global_lse = torch.where(valid, safe_max + weight.log(), maximum)
     return result, global_lse
 
@@ -31,13 +42,19 @@ class CudaSummaryTicket:
     device synchronize or CPU assumption about collective completion.
     """
 
-    def __init__(self, out: Tensor, lse: Tensor, group, stream: torch.cuda.Stream):
+    def __init__(
+        self, out: Tensor, lse: Tensor, group, stream: torch.cuda.Stream
+    ):
         self.inputs = (out, lse)
         self.works = []
         self.buffers = []
         self.consumed = False
-        if (not out.is_cuda or not lse.is_cuda or out.device != lse.device
-                or stream.device != out.device):
+        if (
+            not out.is_cuda
+            or not lse.is_cuda
+            or out.device != lse.device
+            or stream.device != out.device
+        ):
             raise ValueError("CUDA tensors on one device required")
         if out.shape[:-1] != lse.shape:
             raise ValueError("Summary shapes must match")
@@ -54,27 +71,38 @@ class CudaSummaryTicket:
             lse.record_stream(stream)
             maximum = lse.float().clone(memory_format=torch.contiguous_format)
             self.buffers.append(maximum)
-            work = dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=group, async_op=True)
+            work = dist.all_reduce(
+                maximum, op=dist.ReduceOp.MAX, group=group, async_op=True
+            )
             self.works.append(work)
-            work.wait()  # NCCL Work.wait establishes dependency on this stream.
+            # Work.wait establishes dependency on this NCCL stream.
+            work.wait()
             safe_max = maximum.masked_fill(maximum.isneginf(), 0)
             self.buffers.append(safe_max)
             weight = (lse.float() - safe_max).exp().contiguous()
             self.buffers.append(weight)
-            numerator = (torch.where(weight.unsqueeze(-1) > 0, out.float(), 0) * weight.unsqueeze(-1)).contiguous()
+            numerator = (
+                torch.where(weight.unsqueeze(-1) > 0, out.float(), 0)
+                * weight.unsqueeze(-1)
+            ).contiguous()
             self.buffers.append(numerator)
             for tensor in (weight, numerator):
-                work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group, async_op=True)
+                work = dist.all_reduce(
+                    tensor, op=dist.ReduceOp.SUM, group=group, async_op=True
+                )
                 self.works.append(work)
                 work.wait()
-            result = numerator / weight.clamp_min(torch.finfo(weight.dtype).tiny).unsqueeze(-1)
-            global_lse = torch.where(weight > 0, safe_max + weight.log(), maximum)
+            result = numerator / weight.clamp_min(
+                torch.finfo(weight.dtype).tiny
+            ).unsqueeze(-1)
+            global_lse = torch.where(
+                weight > 0, safe_max + weight.log(), maximum
+            )
             self.buffers.extend((result, global_lse))
             for tensor in self.buffers:
                 tensor.record_stream(stream)
             self.completed = torch.cuda.Event()
             self.completed.record(stream)
-        self.consumed = False
 
     def consume(self) -> tuple[Tensor, Tensor]:
         if self.consumed:
@@ -131,7 +159,9 @@ class OneTicketQueue:
 
     def close(self):
         if self.poisoned:
-            raise RuntimeError("Failed queue must remain owned until worker exit")
+            raise RuntimeError(
+                "Failed queue must remain owned until worker exit"
+            )
         if self.ticket is not None:
             try:
                 self.ticket.completed.synchronize()

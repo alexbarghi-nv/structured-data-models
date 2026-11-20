@@ -12,14 +12,13 @@ from torch import Tensor
 
 import sdm.processing as sp
 from sdm import EnsembleTable, Recipe, Stype, TableTensor
-from sdm.models.kumo.tabular.column_shard import split_inputs
 from sdm.models.kumo.tabular.column_metadata import (
     column_dictionary,
     encode_column_metadata,
     gather_column_metadata,
 )
+from sdm.models.kumo.tabular.column_shard import split_inputs
 from sdm.models.kumo.tabular.input import ColumnShard
-from sdm.models.kumo.tabular.typed_exchange import exchange_member
 from sdm.models.kumo.tabular.partition import (
     PreparedContext,
     halo_indices,
@@ -30,6 +29,7 @@ from sdm.models.kumo.tabular.sampling import (
     _ShuffleColumns,
     sampling_recipe,
 )
+from sdm.models.kumo.tabular.typed_exchange import exchange_member
 from sdm.processing.execution import (
     MemberContext,
     MemberQuery,
@@ -138,9 +138,7 @@ def fit_sharded(
         )
         processed = prepared.local_route.fit_transform_ensemble(on_device)
         # Retain processed feature values on their processing device.
-        local = [
-            cast(TableTensor, processed[i]) for i in range(len(processed))
-        ]
+        local = [processed[i] for i in range(len(processed))]
         # Generated counts can reuse dropped raw numerical names. Fitted route
         # ownership determines the global numerical sign draws.
         numerical_route = cast(
@@ -469,7 +467,7 @@ def transform_sharded(
         processed = prepared.local_route.transform_ensemble(on_device)
         local = []
         for member in range(len(processed)):
-            table = cast(TableTensor, processed[member])
+            table = processed[member]
             local.append(
                 table.replace_blocks(
                     numerical=(

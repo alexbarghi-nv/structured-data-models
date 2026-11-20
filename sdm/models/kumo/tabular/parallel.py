@@ -12,8 +12,12 @@ from torch import Tensor
 
 from sdm._memory import chunk_memory_limit
 from sdm._token_buffer import TokenBuffer
-from sdm.distributed._summary_merge import CudaSummaryTicket, OneTicketQueue, merge_summary
 from sdm.cache import Cache, KVCacheEntry
+from sdm.distributed._summary_merge import (
+    CudaSummaryTicket,
+    OneTicketQueue,
+    merge_summary,
+)
 from sdm.distributed.attention import distributed_transformer_block
 from sdm.distributed.layout import TableMesh
 from sdm.models.kumo.tabular.model import _KumoTabular
@@ -192,23 +196,42 @@ class _DistributedKumoTabular(torch.nn.Module):
         cache: Cache,
     ) -> Tensor:
         if self._fused_async_queue is not None:
-            # Any outstanding or failed queue must never be bypassed by fallback.
-            raise RuntimeError('Previous async summary did not close')
-        fused_eligible = (self._fused_pure_row and self.mesh.feature_parts == 1
-                          and x.dtype == torch.float32
-                          and not torch.is_autocast_enabled(x.device.type))
+            # Any outstanding or failed queue must never be bypassed by
+            # fallback.
+            raise RuntimeError("Previous async summary did not close")
+        fused_eligible = (
+            self._fused_pure_row
+            and self.mesh.feature_parts == 1
+            and x.dtype == torch.float32
+            and not torch.is_autocast_enabled(x.device.type)
+        )
         if self._fused_column_pipeline:
             if not self._fused_replay_original:
                 raise RuntimeError("Column pipeline requires original replay")
             if not cache.is_replaying:
-                if not (fused_eligible and not torch.is_grad_enabled()
-                        and self._fused_chunk_rows == 512 and self._fused_feature_tile == 64
-                        and ((x.is_cuda and self._fused_async) or (not x.is_cuda and not self._fused_async))):
-                    raise RuntimeError("Column pipeline requires fixed pure-row inference configuration")
-                return self._embed_rows_fused_column_pipeline(x, y, categorical_mask, context_rows, cache)
-        if fused_eligible:
-            if not (self._fused_replay_original and cache.is_replaying):
-                return self._embed_rows_fused(x, y, categorical_mask, context_rows, cache)
+                if not (
+                    fused_eligible
+                    and not torch.is_grad_enabled()
+                    and self._fused_chunk_rows == 512
+                    and self._fused_feature_tile == 64
+                    and (
+                        (x.is_cuda and self._fused_async)
+                        or (not x.is_cuda and not self._fused_async)
+                    )
+                ):
+                    raise RuntimeError(
+                        "Column pipeline requires fixed pure-row "
+                        "inference configuration"
+                    )
+                return self._embed_rows_fused_column_pipeline(
+                    x, y, categorical_mask, context_rows, cache
+                )
+        if fused_eligible and not (
+            self._fused_replay_original and cache.is_replaying
+        ):
+            return self._embed_rows_fused(
+                x, y, categorical_mask, context_rows, cache
+            )
         embedding = self.model.row_embedding
         feature_count = cast(
             int, cache.get("distributed.feature_count", x.size(-1))
@@ -327,27 +350,67 @@ class _DistributedKumoTabular(torch.nn.Module):
         return embedding.norm(readout).flatten(-2)
 
     def _embed_rows_fused(
-        self, x: Tensor, y: Tensor, categorical_mask: Tensor,
-        context_rows: int, cache: Cache,
+        self,
+        x: Tensor,
+        y: Tensor,
+        categorical_mask: Tensor,
+        context_rows: int,
+        cache: Cache,
     ) -> Tensor:
-        """Experimental L+1 pure-row passes; optional overlap is unmeasured."""
+        return self._embed_rows_fused_impl(
+            x, y, categorical_mask, context_rows, cache, pipeline=False
+        )
+
+    def _embed_rows_fused_impl(
+        self,
+        x: Tensor,
+        y: Tensor,
+        categorical_mask: Tensor,
+        context_rows: int,
+        cache: Cache,
+        *,
+        pipeline: bool,
+    ) -> Tensor:
+        """Record/replay chunked rows with optional tiled column pipelining."""
         embedding = self.model.row_embedding
-        feature_count = cast(int, cache.get("distributed.feature_count", x.size(-1)))
+        feature_count = cast(
+            int, cache.get("distributed.feature_count", x.size(-1))
+        )
         if feature_count == 0 or context_rows == 0:
-            raise ValueError("Fused pure-row path requires context and features")
+            raise ValueError(
+                "Fused pure-row path requires context and features"
+            )
         *batch, rows, _ = x.shape
         channels = embedding.channels
         count = embedding.readout_token.size(-2)
-        buffer = TokenBuffer((*batch, rows, count + feature_count, channels), dtype=x.dtype, device=x.device)
+        buffer = TokenBuffer(
+            (*batch, rows, count + feature_count, channels),
+            dtype=x.dtype,
+            device=x.device,
+        )
         tokens = buffer.tensor.transpose(-2, -3)
         positions = torch.arange(count + feature_count, device=x.device)
         layers = len(embedding.row_blocks)
         key_value: KVCacheEntry | None = None
         # Explicit bounded views for the resident buffer; no new public API.
-        bytes_per_row = max(1, math.prod(batch) * (count + feature_count) * channels * x.element_size())
-        budget = chunk_memory_limit(x.device) if x.is_cuda else 16 * 1024 * 1024
-        chunk_rows = self._fused_chunk_rows or max(1, budget // max(8 * bytes_per_row, 1))
-        tile_size = feature_count if self._fused_feature_tile is None else self._fused_feature_tile
+        bytes_per_row = max(
+            1,
+            math.prod(batch)
+            * (count + feature_count)
+            * channels
+            * x.element_size(),
+        )
+        budget = (
+            chunk_memory_limit(x.device) if x.is_cuda else 16 * 1024 * 1024
+        )
+        chunk_rows = self._fused_chunk_rows or max(
+            1, budget // max(8 * bytes_per_row, 1)
+        )
+        tile_size = (
+            feature_count
+            if self._fused_feature_tile is None
+            else self._fused_feature_tile
+        )
         if tile_size <= 0:
             raise ValueError("Feature tile must be positive")
         use_async = self._fused_async and x.is_cuda
@@ -365,26 +428,57 @@ class _DistributedKumoTabular(torch.nn.Module):
                 stop = min(start + chunk_rows, rows)
                 chunk = tokens[..., start:stop, :, :]
                 if index == 0:
-                    chunk[..., :count, :] = embedding.readout_token.to(chunk.dtype)
-                    chunk_cells = self._embed_cells(x[..., start:stop, :], categorical_mask, 0, feature_count, cache)
+                    chunk[..., :count, :] = embedding.readout_token.to(
+                        chunk.dtype
+                    )
+                    chunk_cells = self._embed_cells(
+                        x[..., start:stop, :],
+                        categorical_mask,
+                        0,
+                        feature_count,
+                        cache,
+                    )
                     if y.numel():
-                        target = embedding.y_emb(y[..., start:stop]) if embedding.y_emb is not None else embedding.y_lin(y[..., start:stop].unsqueeze(-1))
-                        chunk_cells += target.unsqueeze(-2).to(chunk_cells.dtype)
+                        if embedding.y_emb is not None:
+                            target = embedding.y_emb(y[..., start:stop])
+                        else:
+                            assert embedding.y_lin is not None
+                            target = embedding.y_lin(
+                                y[..., start:stop].unsqueeze(-1)
+                            )
+                        chunk_cells += target.unsqueeze(-2).to(
+                            chunk_cells.dtype
+                        )
                         del target
                     chunk[..., count:, :] = chunk_cells
                     del chunk_cells
                 else:
-                    column = embedding.col_blocks[index - 1]
-                    column_cells = chunk[..., count:, :].transpose(-2, -3)
-                    column(query=column_cells, key_value=key_value, batch_size_limit="auto", out=column_cells)
+                    if not pipeline:
+                        column = cast(
+                            InducedTransformerBlock,
+                            embedding.col_blocks[index - 1],
+                        )
+                        column_cells = chunk[..., count:, :].transpose(-2, -3)
+                        column(
+                            query=column_cells,
+                            key_value=key_value,
+                            batch_size_limit="auto",
+                            out=column_cells,
+                        )
                     final = index == layers
                     result = distributed_transformer_block(
-                        embedding.row_blocks[index - 1],
+                        cast(
+                            TransformerBlock, embedding.row_blocks[index - 1]
+                        ),
                         query=chunk[..., :count, :] if final else chunk,
-                        key_value=chunk, group=self.mesh.feature_group,
+                        key_value=chunk,
+                        group=self.mesh.feature_group,
                         global_key_length=count + feature_count,
-                        query_positions=positions[:count] if final else positions,
-                        key_positions=positions, return_key_value=False,
+                        query_positions=positions[:count]
+                        if final
+                        else positions,
+                        key_positions=positions,
+                        return_key_value=False,
                         **self.attention_options,
                     )
                     if final:
@@ -395,195 +489,199 @@ class _DistributedKumoTabular(torch.nn.Module):
                     if stop == rows:
                         final_chunk = chunk[..., count:, :].transpose(-2, -3)
                     else:
-                        summary = embedding.col_blocks[index].summarize(
+                        summary = cast(
+                            InducedTransformerBlock,
+                            embedding.col_blocks[index],
+                        ).summarize(
                             chunk[..., count:, :].transpose(-2, -3),
-                            key_len=context_rows, summary=summary, batch_size_limit="auto",
+                            key_len=context_rows,
+                            summary=summary,
+                            batch_size_limit="auto",
                         )
             if index < layers:
                 key = f"row_embedding.col_block{index}"
                 if cache.is_replaying:
                     key_value = cast(KVCacheEntry, cache[key])
                 else:
+                    column = cast(
+                        InducedTransformerBlock, embedding.col_blocks[index]
+                    )
                     merged_out, merged_lse = [], []
+                    kv_tiles: list[KVCacheEntry] = []
+                    previous_feature: tuple[int, int] | None = None
                     for feature_start in range(0, feature_count, tile_size):
-                        feature_stop = min(feature_start + tile_size, feature_count)
-                        tile_summary = None if summary is None else (
-                            summary[0][..., feature_start:feature_stop, :, :, :],
-                            summary[1][..., feature_start:feature_stop, :, :],
+                        feature_stop = min(
+                            feature_start + tile_size, feature_count
+                        )
+                        tile_summary = (
+                            None
+                            if summary is None
+                            else (
+                                summary[0][
+                                    ..., feature_start:feature_stop, :, :, :
+                                ],
+                                summary[1][
+                                    ..., feature_start:feature_stop, :, :
+                                ],
+                            )
                         )
                         if final_chunk is not None:
-                            tile_summary = embedding.col_blocks[index].summarize(
-                                final_chunk[..., feature_start:feature_stop, :, :],
-                                key_len=context_rows, summary=tile_summary, batch_size_limit="auto",
+                            tile_summary = column.summarize(
+                                final_chunk[
+                                    ..., feature_start:feature_stop, :, :
+                                ],
+                                key_len=context_rows,
+                                summary=tile_summary,
+                                batch_size_limit="auto",
                             )
                         if tile_summary is None:
-                            dummy = tokens.new_zeros((*batch, feature_stop - feature_start, 1, channels))
-                            out, lse = embedding.col_blocks[index].summarize(
-                                dummy, key_len=context_rows, batch_size_limit="auto")
-                            tile_summary = (torch.zeros_like(out), torch.full_like(lse, -torch.inf))
+                            dummy = tokens.new_zeros(
+                                (
+                                    *batch,
+                                    feature_stop - feature_start,
+                                    1,
+                                    channels,
+                                )
+                            )
+                            out, lse = column.summarize(
+                                dummy,
+                                key_len=context_rows,
+                                batch_size_limit="auto",
+                            )
+                            tile_summary = (
+                                torch.zeros_like(out),
+                                torch.full_like(lse, -torch.inf),
+                            )
                         if queue is None:
-                            out, lse = merge_summary(*tile_summary, group=self.mesh.row_group)
-                            merged_out.append(out)
-                            merged_lse.append(lse)
-                        else:
-                            # Compute this tile before consuming the preceding
-                            # one: the only legal window is the final local row.
-                            if queue.ticket is not None:
-                                out, lse = queue.drain()
+                            out, lse = merge_summary(
+                                *tile_summary, group=self.mesh.row_group
+                            )
+                        elif queue.ticket is not None:
+                            out, lse = queue.drain()
+                            if not pipeline:
                                 merged_out.append(out)
                                 merged_lse.append(lse)
-                            queue.submit(CudaSummaryTicket, *tile_summary, self.mesh.row_group, comm_stream)
+                        if queue is not None:
+                            queue.submit(
+                                CudaSummaryTicket,
+                                *tile_summary,
+                                self.mesh.row_group,
+                                comm_stream,
+                            )
+                            if pipeline and previous_feature is not None:
+                                kv_tiles.append(
+                                    self._apply_column_tile(
+                                        column,
+                                        tokens,
+                                        count,
+                                        chunk_rows,
+                                        *previous_feature,
+                                        out,
+                                        lse,
+                                    )
+                                )
+                            previous_feature = (feature_start, feature_stop)
+                        elif pipeline:
+                            kv_tiles.append(
+                                self._apply_column_tile(
+                                    column,
+                                    tokens,
+                                    count,
+                                    chunk_rows,
+                                    feature_start,
+                                    feature_stop,
+                                    out,
+                                    lse,
+                                )
+                            )
+                        else:
+                            merged_out.append(out)
+                            merged_lse.append(lse)
                     if queue is not None:
                         out, lse = queue.drain()
-                        merged_out.append(out)
-                        merged_lse.append(lse)
                         queue.close()
-                    summary = (torch.cat(merged_out, dim=-4), torch.cat(merged_lse, dim=-3))
-                    key_value = embedding.col_blocks[index].induced_key_value(summary)
+                        if pipeline:
+                            assert previous_feature is not None
+                            kv_tiles.append(
+                                self._apply_column_tile(
+                                    column,
+                                    tokens,
+                                    count,
+                                    chunk_rows,
+                                    *previous_feature,
+                                    out,
+                                    lse,
+                                )
+                            )
+                        else:
+                            merged_out.append(out)
+                            merged_lse.append(lse)
+                    if pipeline:
+                        key_value = KVCacheEntry(
+                            key=torch.cat([kv.key for kv in kv_tiles], dim=-4),
+                            value=torch.cat(
+                                [kv.value for kv in kv_tiles], dim=-4
+                            ),
+                        )
+                        del kv_tiles
+                    else:
+                        summary = (
+                            torch.cat(merged_out, dim=-4),
+                            torch.cat(merged_lse, dim=-3),
+                        )
+                        key_value = column.induced_key_value(summary)
                     if cache.is_recording:
                         cache[key] = key_value
         self._fused_async_queue = None
         return embedding.norm(tokens[..., :count, :]).flatten(-2)
 
     def _embed_rows_fused_column_pipeline(
-        self, x: Tensor, y: Tensor, categorical_mask: Tensor,
-        context_rows: int, cache: Cache,
+        self,
+        x: Tensor,
+        y: Tensor,
+        categorical_mask: Tensor,
+        context_rows: int,
+        cache: Cache,
     ) -> Tensor:
         # Retain and poison any live ticket on later projection/column failure.
         try:
-            return self._embed_rows_fused_column_pipeline_impl(x, y, categorical_mask, context_rows, cache)
+            return self._embed_rows_fused_impl(
+                x, y, categorical_mask, context_rows, cache, pipeline=True
+            )
         except BaseException:
             if self._fused_async_queue is not None:
                 self._fused_async_queue.poisoned = True
             raise
 
-    def _embed_rows_fused_column_pipeline_impl(
-        self, x: Tensor, y: Tensor, categorical_mask: Tensor,
-        context_rows: int, cache: Cache,
-    ) -> Tensor:
-        """Experimental L+1 pure-row passes; optional overlap is unmeasured."""
-        embedding = self.model.row_embedding
-        feature_count = cast(int, cache.get("distributed.feature_count", x.size(-1)))
-        if feature_count == 0 or context_rows == 0:
-            raise ValueError("Fused pure-row path requires context and features")
-        *batch, rows, _ = x.shape
-        channels = embedding.channels
-        count = embedding.readout_token.size(-2)
-        buffer = TokenBuffer((*batch, rows, count + feature_count, channels), dtype=x.dtype, device=x.device)
-        tokens = buffer.tensor.transpose(-2, -3)
-        positions = torch.arange(count + feature_count, device=x.device)
-        layers = len(embedding.row_blocks)
-        key_value: KVCacheEntry | None = None
-        # Explicit bounded views for the resident buffer; no new public API.
-        bytes_per_row = max(1, math.prod(batch) * (count + feature_count) * channels * x.element_size())
-        budget = chunk_memory_limit(x.device) if x.is_cuda else 16 * 1024 * 1024
-        chunk_rows = self._fused_chunk_rows or max(1, budget // max(8 * bytes_per_row, 1))
-        tile_size = feature_count if self._fused_feature_tile is None else self._fused_feature_tile
-        if tile_size <= 0:
-            raise ValueError("Feature tile must be positive")
-        use_async = self._fused_async and x.is_cuda
-        if self._fused_async and not x.is_cuda:
-            raise ValueError("Async fused summary requires CUDA")
-        if self._fused_async_queue is not None:
-            raise RuntimeError("Previous async summary did not close")
-        queue = OneTicketQueue() if use_async else None
-        self._fused_async_queue = queue
-        comm_stream = torch.cuda.Stream(device=x.device) if use_async else None
-        for index in range(layers + 1):
-            summary = None
-            final_chunk = None
-            for start in range(0, rows, chunk_rows):
-                stop = min(start + chunk_rows, rows)
-                chunk = tokens[..., start:stop, :, :]
-                if index == 0:
-                    chunk[..., :count, :] = embedding.readout_token.to(chunk.dtype)
-                    chunk_cells = self._embed_cells(x[..., start:stop, :], categorical_mask, 0, feature_count, cache)
-                    if y.numel():
-                        target = embedding.y_emb(y[..., start:stop]) if embedding.y_emb is not None else embedding.y_lin(y[..., start:stop].unsqueeze(-1))
-                        chunk_cells += target.unsqueeze(-2).to(chunk_cells.dtype)
-                        del target
-                    chunk[..., count:, :] = chunk_cells
-                    del chunk_cells
-                else:
-                    # The preceding feature loop already applied the whole column pass.
-                    final = index == layers
-                    result = distributed_transformer_block(
-                        embedding.row_blocks[index - 1],
-                        query=chunk[..., :count, :] if final else chunk,
-                        key_value=chunk, group=self.mesh.feature_group,
-                        global_key_length=count + feature_count,
-                        query_positions=positions[:count] if final else positions,
-                        key_positions=positions, return_key_value=False,
-                        **self.attention_options,
-                    )
-                    if final:
-                        chunk[..., :count, :] = result
-                    else:
-                        chunk.copy_(result)
-                if index < layers and not cache.is_replaying:
-                    if stop == rows:
-                        final_chunk = chunk[..., count:, :].transpose(-2, -3)
-                    else:
-                        summary = embedding.col_blocks[index].summarize(
-                            chunk[..., count:, :].transpose(-2, -3),
-                            key_len=context_rows, summary=summary, batch_size_limit="auto",
-                        )
-            if index < layers:
-                key = f"row_embedding.col_block{index}"
-                if cache.is_replaying:
-                    key_value = cast(KVCacheEntry, cache[key])
-                else:
-                    kv_tiles = []
-                    previous_feature = None
-
-                    def apply_tile(feature_start: int, feature_stop: int, out: Tensor, lse: Tensor) -> None:
-                        tile_kv = embedding.col_blocks[index].induced_key_value((out, lse))
-                        kv_tiles.append(tile_kv)
-                        for row_start in range(0, rows, chunk_rows):
-                            row_stop = min(row_start + chunk_rows, rows)
-                            cells = tokens[..., row_start:row_stop, count + feature_start:count + feature_stop, :].transpose(-2, -3)
-                            embedding.col_blocks[index](query=cells, key_value=tile_kv, batch_size_limit="auto", out=cells)
-
-                    for feature_start in range(0, feature_count, tile_size):
-                        feature_stop = min(feature_start + tile_size, feature_count)
-                        tile_summary = None if summary is None else (
-                            summary[0][..., feature_start:feature_stop, :, :, :],
-                            summary[1][..., feature_start:feature_stop, :, :],
-                        )
-                        if final_chunk is not None:
-                            tile_summary = embedding.col_blocks[index].summarize(
-                                final_chunk[..., feature_start:feature_stop, :, :],
-                                key_len=context_rows, summary=tile_summary, batch_size_limit="auto",
-                            )
-                        if tile_summary is None:
-                            dummy = tokens.new_zeros((*batch, feature_stop - feature_start, 1, channels))
-                            out, lse = embedding.col_blocks[index].summarize(
-                                dummy, key_len=context_rows, batch_size_limit="auto")
-                            tile_summary = (torch.zeros_like(out), torch.full_like(lse, -torch.inf))
-                        if queue is None:
-                            out, lse = merge_summary(*tile_summary, group=self.mesh.row_group)
-                            apply_tile(feature_start, feature_stop, out, lse)
-                        else:
-                            if queue.ticket is not None:
-                                out, lse = queue.drain()
-                            queue.submit(CudaSummaryTicket, *tile_summary, self.mesh.row_group, comm_stream)
-                            if previous_feature is not None:
-                                apply_tile(*previous_feature, out, lse)
-                            previous_feature = (feature_start, feature_stop)
-                    if queue is not None:
-                        out, lse = queue.drain()
-                        queue.close()
-                        assert previous_feature is not None
-                        apply_tile(*previous_feature, out, lse)
-                    key_value = KVCacheEntry(
-                        key=torch.cat([kv.key for kv in kv_tiles], dim=-4),
-                        value=torch.cat([kv.value for kv in kv_tiles], dim=-4),
-                    )
-                    del kv_tiles
-                    if cache.is_recording:
-                        cache[key] = key_value
-        self._fused_async_queue = None
-        return embedding.norm(tokens[..., :count, :]).flatten(-2)
+    def _apply_column_tile(
+        self,
+        column: InducedTransformerBlock,
+        tokens: Tensor,
+        readout_count: int,
+        chunk_rows: int,
+        feature_start: int,
+        feature_stop: int,
+        out: Tensor,
+        lse: Tensor,
+    ) -> KVCacheEntry:
+        """Apply one completed column summary to resident row chunks."""
+        key_value = column.induced_key_value((out, lse))
+        rows = tokens.size(-3)
+        for start in range(0, rows, chunk_rows):
+            stop = min(start + chunk_rows, rows)
+            cells = tokens[
+                ...,
+                start:stop,
+                readout_count + feature_start : readout_count + feature_stop,
+                :,
+            ].transpose(-2, -3)
+            column(
+                query=cells,
+                key_value=key_value,
+                batch_size_limit="auto",
+                out=cells,
+            )
+        return key_value
 
     def _icl(
         self, x: Tensor, y: Tensor, context_rows: int, cache: Cache
