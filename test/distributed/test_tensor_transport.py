@@ -16,8 +16,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-import sdm.models.kumo.tabular.prepared as prepared_module
-from sdm import StringTensor, TableTensor
+from sdm import StringTensor
 from sdm.cache import Cache, KVCacheEntry
 from sdm.distributed.layout import TableMesh
 from sdm.distributed.tensor_control import (
@@ -26,12 +25,10 @@ from sdm.distributed.tensor_control import (
     pack,
     unpack,
 )
-from sdm.models.kumo.tabular.distributed import ContextParallelKumoTabular
-from sdm.models.kumo.tabular.model import MODEL_KWARGS
 from sdm.models.kumo.tabular.prepared import PreparedInputs
 from sdm.models.kumo.tabular.sharded_offload import ShardedColumnOffload
 from sdm.models.kumo.tabular.typed_exchange import exchange_member
-from test.distributed.test_column_metadata import host_value, legacy_fit
+from test.distributed._kumo import check_public_offload
 
 
 def forbidden(*args, **kwargs):
@@ -228,137 +225,13 @@ def worker(rank, world, path, backend, subgroup, model):
                 RuntimeError, match="fresh distributed session"
             ):
                 broken.reduce(0)
-        if not model:
-            return
-        original_kwargs = MODEL_KWARGS["small"]
-        MODEL_KWARGS["small"] = {
-            "cell_channels": 8,
-            "num_embedding_layers": 2,
-            "num_embedding_heads": 2,
-            "num_inducing_points": 3,
-            "group_size": 3,
-            "num_frequencies": 2,
-            "num_readout_tokens": 2,
-            "icl_channels": 16,
-            "num_icl_layers": 3,
-            "num_icl_heads": 4,
-            "num_icl_key_value_heads_for_query": 2,
-        }
-        candidate = prepared_module.fit_sharded
-        candidate_transform = prepared_module.transform_sharded
-        baseline = legacy_fit()
-        broadcast, scatter = PreparedInputs.broadcast, PreparedInputs.scatter
-        x = TableTensor.from_tensor(
-            torch.arange(19 * 17).view(19, 17).float().sin()
-        )
-        query = TableTensor.from_tensor(
-            torch.arange(51).view(3, 17).float().cos()
-        )
-        x.numerical[2, 0] = torch.nan
-        try:
-            for task in ["regression", "classification"]:
-                outputs = []
-                for implementation in [baseline, candidate]:
-                    # The frozen pre14 reference still reads its mode selector.
-                    with (
-                        patch.object(
-                            PreparedInputs, "mode", "sharded_cuda", create=True
-                        ),
-                        patch.object(
-                            prepared_module, "fit_sharded", implementation
-                        ),
-                        patch.object(
-                            prepared_module,
-                            "transform_sharded",
-                            implementation.__globals__["transform_sharded"],
-                        ),
-                        patch.object(
-                            PreparedInputs,
-                            "broadcast",
-                            broadcast
-                            if implementation is candidate
-                            else lambda self, *a, **kw: host_value(
-                                broadcast(self, *a, **kw)
-                            ),
-                        ),
-                        patch.object(
-                            PreparedInputs,
-                            "scatter",
-                            scatter
-                            if implementation is candidate
-                            else lambda self, *a, **kw: host_value(
-                                scatter(self, *a, **kw)
-                            ),
-                        ),
-                    ):
-                        torch.manual_seed(42)
-                        m = ContextParallelKumoTabular(
-                            task=task,
-                            size="small",
-                            pretrained=False,
-                            device=device,
-                            layout="mesh",
-                            mesh_shape=(size, 1),
-                            sharded_column_offload=True,
-                        )
-                        # Constructor uses WORLD; lifecycle cases run on WORLD
-                        # only.
-                        guards = []
-                        if implementation is candidate:
-                            for name in [
-                                "all_gather_object",
-                                "broadcast_object_list",
-                                "scatter_object_list",
-                            ]:
-                                guard = patch.object(dist, name, forbidden)
-                                guard.start()
-                                guards.append(guard)
-                        try:
-                            y = torch.arange(19).view(-1, 1)
-                            y = (
-                                y % 3
-                                if task == "classification"
-                                else y.float().sin()
-                            )
-                            m.fit(
-                                x if rank == 0 else None,
-                                y if rank == 0 else None,
-                                num_estimators=2,
-                                generator=torch.Generator(
-                                    device=device
-                                ).manual_seed(37),
-                            )
-                            first = (
-                                m.predict(query if rank == 0 else None)
-                                .numerical.cpu()
-                                .clone()
-                            )
-                            repeat = (
-                                m.predict(query if rank == 0 else None)
-                                .numerical.cpu()
-                                .clone()
-                            )
-                            torch.testing.assert_close(
-                                first, repeat, atol=0, rtol=0
-                            )
-                            outputs.append(first)
-                            m.clear()
-                        finally:
-                            for guard in reversed(guards):
-                                guard.stop()
-                torch.testing.assert_close(
-                    outputs[0], outputs[1], atol=1e-6, rtol=1e-5
-                )
-                if backend == "gloo":
-                    assert torch.equal(outputs[0], outputs[1])
-        finally:
-            prepared_module.fit_sharded = candidate
-            prepared_module.transform_sharded = candidate_transform
-            PreparedInputs.broadcast, PreparedInputs.scatter = (
-                broadcast,
-                scatter,
-            )
-            MODEL_KWARGS["small"] = original_kwargs
+        if model:
+            with (
+                patch.object(dist, "all_gather_object", forbidden),
+                patch.object(dist, "broadcast_object_list", forbidden),
+                patch.object(dist, "scatter_object_list", forbidden),
+            ):
+                check_public_offload(rank, size, device)
     finally:
         dist.destroy_process_group()
 

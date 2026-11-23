@@ -23,6 +23,7 @@ from sdm.models.kumo.tabular.model import (
     KumoTabular,
     _KumoTabular,
 )
+from test.distributed._kumo import TINY_MODEL_KWARGS
 
 
 class _CheckpointKumo(ContextParallelKumoTabular):
@@ -212,19 +213,7 @@ def _public_lifecycle(
     mesh_shape: tuple[int, int] | None = None,
 ) -> None:
     original = MODEL_KWARGS["small"]
-    MODEL_KWARGS["small"] = {
-        "cell_channels": 8,
-        "num_embedding_layers": 2,
-        "num_embedding_heads": 2,
-        "num_inducing_points": 3,
-        "group_size": 3,
-        "num_frequencies": 2,
-        "num_readout_tokens": 2,
-        "icl_channels": 16,
-        "num_icl_layers": 3,
-        "num_icl_heads": 4,
-        "num_icl_key_value_heads_for_query": 2,
-    }
+    MODEL_KWARGS["small"] = TINY_MODEL_KWARGS
     try:
         for task in ["regression", "classification"]:
             reference = KumoTabular(

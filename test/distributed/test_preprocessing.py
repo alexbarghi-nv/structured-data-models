@@ -3,6 +3,7 @@
 
 import os
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -12,14 +13,16 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed import ProcessGroup
 
+import sdm.models.kumo.tabular.sharded_recipe as sharded_recipe
 import sdm.processing as sp
-from sdm import CategoricalTensor, Recipe, TableTensor
+from sdm import CategoricalTensor, Recipe, Stype, TableTensor
 from sdm.distributed.layout import TableMesh
 from sdm.models.kumo.tabular.distributed import ContextParallelKumoTabular
 from sdm.models.kumo.tabular.model import MODEL_KWARGS, KumoTabular
 from sdm.models.kumo.tabular.prepared import PreparedInputs
 from sdm.models.kumo.tabular.recipe import default_recipe
 from sdm.processing.execution import RecipeExecution
+from test.distributed._kumo import TINY_MODEL_KWARGS
 
 
 def _cases() -> list[
@@ -34,7 +37,7 @@ def _cases() -> list[
     )
     mixed = TableTensor(
         columns={
-            "numerical": [f"n{i}" for i in range(7)],
+            "numerical": ["z", "cat__count", "a", "é", "b", "n5", "n6"],
             "categorical": ["cat", "smallcat"],
         },
         numerical=numerical,
@@ -89,6 +92,13 @@ def _cases() -> list[
             8,
         ),
         (wide, wide[:2], torch.arange(9).reshape(-1, 1).float().sin(), 2, 500),
+        (
+            TableTensor.from_tensor(torch.arange(9).view(9, 1).float()),
+            TableTensor.from_tensor(torch.arange(3).view(3, 1).float()),
+            torch.arange(9).view(-1, 1).float(),
+            2,
+            1,
+        ),
     ]
 
 
@@ -142,6 +152,31 @@ def _preprocessing_parity(
                 atol=tolerance,
                 rtol=tolerance,
             )
+            assert member.feature_count == original.x.size(-1)
+            expected_names = tuple(
+                original.x.columns[Stype.numerical][index]
+                for index in member.feature_indices.tolist()
+            )
+            assert (
+                tuple(member.context.x.columns[Stype.numerical])
+                == expected_names
+            )
+            expected_mask = torch.tensor(
+                [
+                    original.input_stypes.get(name) == Stype.categorical
+                    for name in expected_names
+                ],
+                dtype=torch.bool,
+            )
+            assert torch.equal(member.categorical_mask.cpu(), expected_mask)
+            mean = original.x.numerical.nanmean(-2, keepdim=True)
+            mean = mean.masked_fill(mean.isnan(), 0)
+            torch.testing.assert_close(
+                member.mean,
+                mean.index_select(-1, member.feature_indices.to(device)).cpu(),
+                atol=tolerance,
+                rtol=tolerance,
+            )
             torch.testing.assert_close(
                 member.context.y.numerical,
                 original.y.numerical[..., start:end, :].cpu(),
@@ -176,19 +211,7 @@ def _lifecycle(
 ) -> None:
     device = torch.device("cpu") if device is None else device
     original = MODEL_KWARGS["small"]
-    MODEL_KWARGS["small"] = {
-        "cell_channels": 8,
-        "num_embedding_layers": 2,
-        "num_embedding_heads": 2,
-        "num_inducing_points": 3,
-        "group_size": 3,
-        "num_frequencies": 2,
-        "num_readout_tokens": 2,
-        "icl_channels": 16,
-        "num_icl_layers": 3,
-        "num_icl_heads": 4,
-        "num_icl_key_value_heads_for_query": 2,
-    }
+    MODEL_KWARGS["small"] = TINY_MODEL_KWARGS
     try:
         x = TableTensor.from_tensor(
             torch.arange(19 * 17).reshape(19, 17).float().sin()
@@ -295,6 +318,56 @@ def _failure_propagation(rank: int, mesh: TableMesh) -> None:
             1,
             torch.Generator(),
         )
+    original_route = sharded_recipe._deterministic_route
+    encoder = sharded_recipe.encode_column_metadata
+    for failure in ("route", "metadata"):
+        with pytest.MonkeyPatch.context() as patch:
+            if failure == "route":
+
+                class FailingRoute:
+                    def to(self, device):
+                        raise RuntimeError("injected route transfer failure")
+
+                patch.setattr(
+                    sharded_recipe,
+                    "_deterministic_route",
+                    lambda recipe: (
+                        FailingRoute()
+                        if mesh.rank == mesh.world_size - 1
+                        else original_route(recipe)
+                    ),
+                )
+                message = "injected route transfer failure"
+            else:
+
+                def invalid_name(metadata, dictionary):
+                    if mesh.rank == mesh.world_size - 1:
+                        return encoder(
+                            [(("injected_unknown_column",), (), ())],
+                            dictionary,
+                        )
+                    return encoder(metadata, dictionary)
+
+                patch.setattr(
+                    sharded_recipe, "encode_column_metadata", invalid_name
+                )
+                message = "injected_unknown_column"
+            failing = PreparedInputs(mesh, torch.device("cpu"), 3)
+            with pytest.raises(RuntimeError, match=message) as caught:
+                failing.fit(
+                    x if rank == 0 else None,
+                    y if rank == 0 else None,
+                    default_recipe(),
+                    1,
+                    torch.Generator(),
+                )
+            assert f"rank {mesh.world_size - 1}:" in str(caught.value)
+            errors: list[str | None] = [None] * mesh.world_size
+            dist.all_gather_object(errors, str(caught.value), group=mesh.group)
+            assert len(set(errors)) == 1
+            completed = torch.tensor([1])
+            dist.all_reduce(completed, group=mesh.group)
+            assert completed.item() == mesh.world_size
     prepared.fit(
         x if rank == 0 else None,
         y if rank == 0 else None,
@@ -380,6 +453,7 @@ def _worker(rank: int, world: int, rendezvous: str) -> None:
         rank=rank,
         world_size=world,
         init_method=f"file://{rendezvous}",
+        timeout=timedelta(seconds=12),
     )
     try:
         mesh = TableMesh("mesh")
@@ -440,11 +514,8 @@ def test_distributed_preprocessing_cuda() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "mode", ["replicated", "rank0_cpu", "sharded_cpu", "sharded_cuda"]
-)
-def test_preprocessing_selector_removed(mode: str) -> None:
-    kwargs: dict[str, Any] = {"preprocessing": mode}
+def test_preprocessing_selector_removed() -> None:
+    kwargs: dict[str, Any] = {"preprocessing": "replicated"}
     with pytest.raises(
         TypeError, match="unexpected keyword argument 'preprocessing'"
     ):

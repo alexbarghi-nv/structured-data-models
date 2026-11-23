@@ -19,20 +19,7 @@ from sdm.models.kumo.tabular.model import MODEL_KWARGS, KumoTabular
 from sdm.models.kumo.tabular.prepared import PreparedInputs
 from sdm.models.kumo.tabular.recipe import default_recipe
 from sdm.processing.execution import RecipeExecution
-
-_TINY = {
-    "cell_channels": 8,
-    "num_embedding_layers": 2,
-    "num_embedding_heads": 2,
-    "num_inducing_points": 3,
-    "group_size": 3,
-    "num_frequencies": 2,
-    "num_readout_tokens": 2,
-    "icl_channels": 16,
-    "num_icl_layers": 3,
-    "num_icl_heads": 4,
-    "num_icl_key_value_heads_for_query": 2,
-}
+from test.distributed._kumo import TINY_MODEL_KWARGS
 
 
 def _data() -> tuple[TableTensor, TableTensor, torch.Tensor]:
@@ -165,7 +152,7 @@ def _write_fixture(directory: Path, world: int) -> None:
             directory / f"expected.rank{rank}.pt",
         )
     original_kwargs = MODEL_KWARGS["small"]
-    MODEL_KWARGS["small"] = _TINY
+    MODEL_KWARGS["small"] = TINY_MODEL_KWARGS
     try:
         for task in ("regression", "classification"):
             targets = (
@@ -239,7 +226,7 @@ def _parity(rank: int, mesh: TableMesh, directory: Path) -> None:
         torch.Generator().manual_seed(37),
     )
     original_kwargs = MODEL_KWARGS["small"]
-    MODEL_KWARGS["small"] = _TINY
+    MODEL_KWARGS["small"] = TINY_MODEL_KWARGS
     try:
         for task in ("regression", "classification"):
             reference = torch.load(
@@ -473,7 +460,7 @@ def _cuda_worker(
         "nccl", rank=rank, world_size=world, init_method=f"file://{rendezvous}"
     )
     original_kwargs = MODEL_KWARGS["small"]
-    MODEL_KWARGS["small"] = _TINY
+    MODEL_KWARGS["small"] = TINY_MODEL_KWARGS
     try:
         mesh = TableMesh("mesh")
         _, contexts, queries, state = _cuda_reference_inputs(
