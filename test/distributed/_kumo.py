@@ -3,6 +3,9 @@
 
 """Shared small-model setup for context-parallel integration tests."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import torch
 
 from sdm import TableTensor
@@ -24,11 +27,36 @@ TINY_MODEL_KWARGS = {
 }
 
 
-def check_public_offload(rank: int, world: int, device: torch.device) -> None:
-    """Cache sharding preserves first/repeat public predictions exactly."""
+@contextmanager
+def tiny_model_config() -> Iterator[None]:
+    """Use cheap models without leaking the override into another test."""
     original = MODEL_KWARGS["small"]
     MODEL_KWARGS["small"] = TINY_MODEL_KWARGS
     try:
+        yield
+    finally:
+        MODEL_KWARGS["small"] = original
+
+
+@torch.no_grad()
+def initialize_parameters(
+    model: torch.nn.Module, device: torch.device
+) -> None:
+    """Give every rank identical, nontrivial weights without random draws."""
+    for index, parameter in enumerate(model.parameters()):
+        parameter.copy_(
+            torch.arange(parameter.numel(), device=device)
+            .reshape(parameter.shape)
+            .mul(0.13)
+            .add(index * 0.2)
+            .sin()
+            .mul(0.2)
+        )
+
+
+def check_public_offload(rank: int, world: int, device: torch.device) -> None:
+    """Cache sharding preserves first/repeat public predictions exactly."""
+    with tiny_model_config():
         x = TableTensor.from_tensor(
             torch.arange(19 * 17).view(19, 17).float().sin()
         )
@@ -79,5 +107,3 @@ def check_public_offload(rank: int, world: int, device: torch.device) -> None:
             finally:
                 for model in models:
                     model.clear()
-    finally:
-        MODEL_KWARGS["small"] = original

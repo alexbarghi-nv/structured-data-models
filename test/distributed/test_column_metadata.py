@@ -4,15 +4,12 @@
 """Integer metadata codecs and tensor gathers, with explicit NCCL opt-in."""
 
 import os
-import tempfile
 from datetime import timedelta
-from pathlib import Path
 from typing import cast
 
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from sdm import Stype
 from sdm.models.kumo.tabular.column_metadata import (
@@ -22,9 +19,12 @@ from sdm.models.kumo.tabular.column_metadata import (
     encode_column_metadata,
     gather_column_metadata,
 )
+from test.distributed._runtime import distributed_session, spawn_workers
 
 
 def test_dictionary_and_codec():
+    """Stable IDs round-trip Unicode, duplicate and empty metadata."""
+    # Include Unicode and a real name that resembles a generated count name.
     schema = {
         Stype.numerical: ("z", "a__count"),
         Stype.categorical: ("é", "a"),
@@ -46,22 +46,9 @@ def test_dictionary_and_codec():
 
 
 def worker(rank, world, path, backend, subgroup):
-    torch.set_num_threads(1)
-    device = (
-        torch.device("cuda", rank)
-        if backend == "nccl"
-        else torch.device("cpu")
-    )
-    if backend == "nccl":
-        torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend,
-        init_method="file://" + path,
-        rank=rank,
-        world_size=world,
-        timeout=timedelta(seconds=90),
-    )
-    try:
+    with distributed_session(
+        rank, world, path, backend=backend, timeout_seconds=90
+    ) as device:
         group = dist.group.WORLD
         if subgroup:
             group = dist.new_group(
@@ -80,6 +67,7 @@ def worker(rank, world, path, backend, subgroup):
                 (("é", "a"), (), ()),
             ]
 
+        # Exchange lengths before gathering uneven ID payloads.
         metadata = metadata_for(local_rank)
         # No object collective in the transport helper, even for uneven
         # lengths.
@@ -102,23 +90,16 @@ def worker(rank, world, path, backend, subgroup):
             ) == [[] for _ in range(size)]
         finally:
             dist.all_gather_object = original
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize(
     ("world", "subgroup"), [(1, False), (2, False), (4, False), (4, True)]
 )
 def test_distributed_metadata(world, subgroup):
+    """Uneven metadata gathers work in full groups and subgroups."""
     backend = os.environ.get("STATUS_BACKEND", "gloo")
     assert backend in ("gloo", "nccl")
     if backend == "nccl":
         assert dist.is_nccl_available()
         assert torch.cuda.device_count() >= world
-    with tempfile.TemporaryDirectory() as tmp:
-        mp.spawn(
-            worker,
-            args=(world, str(Path(tmp) / "rdzv"), backend, subgroup),
-            nprocs=world,
-            join=True,
-        )
+    spawn_workers(worker, world, backend, subgroup)

@@ -1,16 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Native recipe parity, source-only inputs and collective error handling."""
+
 import os
-import tempfile
-from datetime import timedelta
-from pathlib import Path
 from typing import Any, cast
 
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from torch.distributed import ProcessGroup
 
 import sdm.models.kumo.tabular.sharded_recipe as sharded_recipe
@@ -18,17 +16,19 @@ import sdm.processing as sp
 from sdm import CategoricalTensor, Recipe, Stype, TableTensor
 from sdm.distributed.layout import TableMesh
 from sdm.models.kumo.tabular.distributed import ContextParallelKumoTabular
-from sdm.models.kumo.tabular.model import MODEL_KWARGS, KumoTabular
+from sdm.models.kumo.tabular.model import KumoTabular
 from sdm.models.kumo.tabular.prepared import PreparedInputs
 from sdm.models.kumo.tabular.recipe import default_recipe
 from sdm.processing.execution import RecipeExecution
-from test.distributed._kumo import TINY_MODEL_KWARGS
+from test.distributed._kumo import initialize_parameters, tiny_model_config
+from test.distributed._runtime import distributed_session, spawn_workers
 
 
 def _cases() -> list[
     tuple[TableTensor, TableTensor, torch.Tensor, int | None, int]
 ]:
     numerical = torch.arange(67 * 7).reshape(67, 7).float().sin()
+    # Constant, missing and infinite values exercise filtering and imputation.
     numerical[:, 1] = 1
     numerical[2, 3] = torch.nan
     numerical[3, 4] = torch.inf
@@ -54,6 +54,7 @@ def _cases() -> list[
             categories=[torch.tensor([10, 20, 30])],
         ),
     )
+    # Category 90 exists only at query time; fit must not learn from it.
     unseen = TableTensor(
         columns={"categorical": ["a"]},
         categorical=CategoricalTensor(
@@ -62,9 +63,11 @@ def _cases() -> list[
         ),
     )
     varied = torch.arange(8 * 7 * 8).reshape(8, 7, 8).float().sin()
+    # Members lose different numbers of constant columns.
     for member in range(8):
         varied[member, :, :member] = 0
     varied = TableTensor.from_tensor(varied)
+    # Cross the 500-column cap; also keep a singleton-feature case below.
     wide = TableTensor.from_tensor(
         torch.arange(9 * 517).reshape(9, 517).float().mul(0.13).sin()
     )
@@ -102,6 +105,59 @@ def _cases() -> list[
     ]
 
 
+def _assert_prepared_member(
+    member, original, start, end, device, tolerance, max_columns
+):
+    """Check owned values, names, classes, masks and context means."""
+    if max_columns == 500:
+        assert member.feature_count == max_columns
+    selected = (
+        original.x.numerical[..., start:end, :]
+        .index_select(
+            -1,
+            member.feature_indices.to(device),
+        )
+        .cpu()
+    )
+    torch.testing.assert_close(
+        member.context.x.numerical,
+        selected,
+        equal_nan=True,
+        atol=tolerance,
+        rtol=tolerance,
+    )
+    assert member.feature_count == original.x.size(-1)
+    expected_names = tuple(
+        original.x.columns[Stype.numerical][index]
+        for index in member.feature_indices.tolist()
+    )
+    assert tuple(member.context.x.columns[Stype.numerical]) == expected_names
+    expected_mask = torch.tensor(
+        [
+            original.input_stypes.get(name) == Stype.categorical
+            for name in expected_names
+        ],
+        dtype=torch.bool,
+    )
+    assert torch.equal(member.categorical_mask.cpu(), expected_mask)
+    mean = original.x.numerical.nanmean(-2, keepdim=True)
+    mean = mean.masked_fill(mean.isnan(), 0)
+    torch.testing.assert_close(
+        member.mean,
+        mean.index_select(-1, member.feature_indices.to(device)).cpu(),
+        atol=tolerance,
+        rtol=tolerance,
+    )
+    torch.testing.assert_close(
+        member.context.y.numerical,
+        original.y.numerical[..., start:end, :].cpu(),
+    )
+    torch.testing.assert_close(
+        member.context.y.categorical.code,
+        original.y.categorical.code[..., start:end, :].cpu(),
+    )
+
+
 def _preprocessing_parity(
     rank: int,
     mesh: TableMesh,
@@ -135,55 +191,8 @@ def _preprocessing_parity(
             )
         start, end = mesh.rows(x.size(-2))
         for member, original in zip(actual, expected, strict=True):
-            if max_columns == 500:
-                assert member.feature_count == max_columns
-            selected = (
-                original.x.numerical[..., start:end, :]
-                .index_select(
-                    -1,
-                    member.feature_indices.to(device),
-                )
-                .cpu()
-            )
-            torch.testing.assert_close(
-                member.context.x.numerical,
-                selected,
-                equal_nan=True,
-                atol=tolerance,
-                rtol=tolerance,
-            )
-            assert member.feature_count == original.x.size(-1)
-            expected_names = tuple(
-                original.x.columns[Stype.numerical][index]
-                for index in member.feature_indices.tolist()
-            )
-            assert (
-                tuple(member.context.x.columns[Stype.numerical])
-                == expected_names
-            )
-            expected_mask = torch.tensor(
-                [
-                    original.input_stypes.get(name) == Stype.categorical
-                    for name in expected_names
-                ],
-                dtype=torch.bool,
-            )
-            assert torch.equal(member.categorical_mask.cpu(), expected_mask)
-            mean = original.x.numerical.nanmean(-2, keepdim=True)
-            mean = mean.masked_fill(mean.isnan(), 0)
-            torch.testing.assert_close(
-                member.mean,
-                mean.index_select(-1, member.feature_indices.to(device)).cpu(),
-                atol=tolerance,
-                rtol=tolerance,
-            )
-            torch.testing.assert_close(
-                member.context.y.numerical,
-                original.y.numerical[..., start:end, :].cpu(),
-            )
-            torch.testing.assert_close(
-                member.context.y.categorical.code,
-                original.y.categorical.code[..., start:end, :].cpu(),
+            _assert_prepared_member(
+                member, original, start, end, device, tolerance, max_columns
             )
         for _ in range(2):
             queries = prepared.transform(query if rank == 0 else None)
@@ -204,15 +213,90 @@ def _preprocessing_parity(
                 )
 
 
+def _assert_public_predictions(model, query, expected, rank):
+    """First and shorter repeated queries reuse fitted preprocessing state."""
+    actual = model.predict(query if rank == 0 else None)
+    assert actual.columns == expected.columns
+    torch.testing.assert_close(
+        actual.numerical,
+        expected.numerical,
+        atol=2e-5,
+        rtol=2e-4,
+    )
+    repeat = model.predict(query[:1] if rank == 0 else None)
+    torch.testing.assert_close(
+        repeat.numerical,
+        expected.numerical[:1],
+        atol=2e-5,
+        rtol=2e-4,
+    )
+
+
+def _check_public_task(task, rank, device, x, query):
+    """Compare native and context-parallel fit, refit, predict and clear."""
+    reference = KumoTabular(
+        task=task,
+        size="small",
+        pretrained=False,
+        device=device,
+    )
+    with torch.no_grad():
+        initialize_parameters(reference, device)
+    targets = torch.arange(19).reshape(-1, 1)
+    y = targets % 12 if task == "classification" else targets.float().sin()
+    reference.fit(
+        x.to(device),
+        y.to(device),
+        num_estimators=8,
+        estimator_batch_size=2,
+        generator=torch.Generator(device=device).manual_seed(37),
+    )
+    expected = reference.predict(query.to(device))
+    model = ContextParallelKumoTabular(
+        task=task,
+        size="small",
+        pretrained=False,
+        device=device,
+        layout="mesh",
+    )
+    with pytest.raises(ValueError, match="does not support 'offload'"):
+        model.fit(
+            x if rank == 0 else None,
+            y if rank == 0 else None,
+            offload="cpu",
+        )
+    with pytest.raises(ValueError, match="context-only"):
+        model.fit(
+            x if rank == 0 else None,
+            y if rank == 0 else None,
+            context_only_columns=["x0"],
+        )
+    model.models[task].model.load_state_dict(
+        reference.models[task].state_dict()
+    )
+    for _ in range(2):
+        model.fit(
+            x if rank == 0 else None,
+            y if rank == 0 else None,
+            num_estimators=8,
+            estimator_batch_size=2,
+            generator=torch.Generator(device=device).manual_seed(37),
+        )
+        _assert_public_predictions(model, query, expected, rank)
+    model.clear()
+    with pytest.raises(RuntimeError, match="Call fit"):
+        model.predict(query if rank == 0 else None)
+    with pytest.raises(RuntimeError, match=r"fit.*predict"):
+        model(x, y, query)
+
+
 def _lifecycle(
     rank: int,
     world: int,
     device: torch.device | None = None,
 ) -> None:
     device = torch.device("cpu") if device is None else device
-    original = MODEL_KWARGS["small"]
-    MODEL_KWARGS["small"] = TINY_MODEL_KWARGS
-    try:
+    with tiny_model_config():
         x = TableTensor.from_tensor(
             torch.arange(19 * 17).reshape(19, 17).float().sin()
         )
@@ -222,88 +306,42 @@ def _lifecycle(
         x.numerical[2, 0] = torch.nan
         query.numerical[1, 0] = torch.nan
         for task in ("regression", "classification"):
-            reference = KumoTabular(
-                task=task,
-                size="small",
-                pretrained=False,
-                device=device,
-            )
-            with torch.no_grad():
-                for index, parameter in enumerate(reference.parameters()):
-                    parameter.copy_(
-                        torch.arange(parameter.numel(), device=device)
-                        .reshape(parameter.shape)
-                        .mul(0.13)
-                        .add(index * 0.2)
-                        .sin()
-                        .mul(0.2),
-                    )
-            targets = torch.arange(19).reshape(-1, 1)
-            y = (
-                targets % 12
-                if task == "classification"
-                else targets.float().sin()
-            )
-            reference.fit(
-                x.to(device),
-                y.to(device),
-                num_estimators=8,
-                estimator_batch_size=2,
-                generator=torch.Generator(device=device).manual_seed(37),
-            )
-            expected = reference.predict(query.to(device))
-            model = ContextParallelKumoTabular(
-                task=task,
-                size="small",
-                pretrained=False,
-                device=device,
-                layout="mesh",
-            )
-            with pytest.raises(ValueError, match="does not support 'offload'"):
-                model.fit(
-                    x if rank == 0 else None,
-                    y if rank == 0 else None,
-                    offload="cpu",
+            _check_public_task(task, rank, device, x, query)
+
+
+def _inject_preprocessing_failure(
+    patch, mesh, failure, original_route, encoder
+):
+    """Only the last owner fails, before any dependent payload collective."""
+    if failure == "route":
+
+        class FailingRoute:
+            def to(self, device):
+                raise RuntimeError("injected route transfer failure")
+
+        patch.setattr(
+            sharded_recipe,
+            "_deterministic_route",
+            lambda recipe: (
+                FailingRoute()
+                if mesh.rank == mesh.world_size - 1
+                else original_route(recipe)
+            ),
+        )
+        message = "injected route transfer failure"
+    else:
+
+        def invalid_name(metadata, dictionary):
+            if mesh.rank == mesh.world_size - 1:
+                return encoder(
+                    [(("injected_unknown_column",), (), ())],
+                    dictionary,
                 )
-            with pytest.raises(ValueError, match="context-only"):
-                model.fit(
-                    x if rank == 0 else None,
-                    y if rank == 0 else None,
-                    context_only_columns=["x0"],
-                )
-            model.models[task].model.load_state_dict(
-                reference.models[task].state_dict()
-            )
-            for _ in range(2):
-                model.fit(
-                    x if rank == 0 else None,
-                    y if rank == 0 else None,
-                    num_estimators=8,
-                    estimator_batch_size=2,
-                    generator=torch.Generator(device=device).manual_seed(37),
-                )
-                actual = model.predict(query if rank == 0 else None)
-                assert actual.columns == expected.columns
-                torch.testing.assert_close(
-                    actual.numerical,
-                    expected.numerical,
-                    atol=2e-5,
-                    rtol=2e-4,
-                )
-                repeat = model.predict(query[:1] if rank == 0 else None)
-                torch.testing.assert_close(
-                    repeat.numerical,
-                    expected.numerical[:1],
-                    atol=2e-5,
-                    rtol=2e-4,
-                )
-            model.clear()
-            with pytest.raises(RuntimeError, match="Call fit"):
-                model.predict(query if rank == 0 else None)
-            with pytest.raises(RuntimeError, match=r"fit.*predict"):
-                model(x, y, query)
-    finally:
-        MODEL_KWARGS["small"] = original
+            return encoder(metadata, dictionary)
+
+        patch.setattr(sharded_recipe, "encode_column_metadata", invalid_name)
+        message = "injected_unknown_column"
+    return message
 
 
 def _failure_propagation(rank: int, mesh: TableMesh) -> None:
@@ -322,36 +360,9 @@ def _failure_propagation(rank: int, mesh: TableMesh) -> None:
     encoder = sharded_recipe.encode_column_metadata
     for failure in ("route", "metadata"):
         with pytest.MonkeyPatch.context() as patch:
-            if failure == "route":
-
-                class FailingRoute:
-                    def to(self, device):
-                        raise RuntimeError("injected route transfer failure")
-
-                patch.setattr(
-                    sharded_recipe,
-                    "_deterministic_route",
-                    lambda recipe: (
-                        FailingRoute()
-                        if mesh.rank == mesh.world_size - 1
-                        else original_route(recipe)
-                    ),
-                )
-                message = "injected route transfer failure"
-            else:
-
-                def invalid_name(metadata, dictionary):
-                    if mesh.rank == mesh.world_size - 1:
-                        return encoder(
-                            [(("injected_unknown_column",), (), ())],
-                            dictionary,
-                        )
-                    return encoder(metadata, dictionary)
-
-                patch.setattr(
-                    sharded_recipe, "encode_column_metadata", invalid_name
-                )
-                message = "injected_unknown_column"
+            message = _inject_preprocessing_failure(
+                patch, mesh, failure, original_route, encoder
+            )
             failing = PreparedInputs(mesh, torch.device("cpu"), 3)
             with pytest.raises(RuntimeError, match=message) as caught:
                 failing.fit(
@@ -362,6 +373,7 @@ def _failure_propagation(rank: int, mesh: TableMesh) -> None:
                     torch.Generator(),
                 )
             assert f"rank {mesh.world_size - 1}:" in str(caught.value)
+            # Test-only gather compares errors after the typed path failed.
             errors: list[str | None] = [None] * mesh.world_size
             dist.all_gather_object(errors, str(caught.value), group=mesh.group)
             assert len(set(errors)) == 1
@@ -384,13 +396,7 @@ def _subgroup_worker(rank: int, world: int, rendezvous: str) -> None:
     # Keep references across session teardown to detect stale cached groups.
     prior: list[PreparedInputs] = []
     for session in range(2):
-        dist.init_process_group(
-            "gloo",
-            rank=rank,
-            world_size=world,
-            init_method=f"file://{rendezvous}-{session}",
-        )
-        try:
+        with distributed_session(rank, world, f"{rendezvous}-{session}"):
             parents = [
                 dist.new_group([0, 2], backend="gloo"),
                 dist.new_group([1, 3], backend="gloo"),
@@ -433,58 +439,33 @@ def _subgroup_worker(rank: int, world: int, rendezvous: str) -> None:
                 assert value.item() == (2 if source == 0 else 4)
             assert dist.get_pg_count() == groups
             dist.barrier()
-        finally:
-            dist.destroy_process_group()
 
 
 def test_preprocessing_subgroups_and_session_reuse() -> None:
-    with tempfile.TemporaryDirectory() as directory:
-        mp.spawn(
-            _subgroup_worker,
-            args=(4, str(Path(directory) / "rendezvous")),
-            nprocs=4,
-        )
+    """Subgroups stay isolated and cached groups survive session changes."""
+    spawn_workers(_subgroup_worker, 4)
 
 
 def _worker(rank: int, world: int, rendezvous: str) -> None:
-    torch.set_num_threads(1)
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"file://{rendezvous}",
-        timeout=timedelta(seconds=12),
-    )
-    try:
+    with distributed_session(
+        rank, world, rendezvous, backend="gloo", timeout_seconds=12
+    ):
         mesh = TableMesh("mesh")
         _preprocessing_parity(rank, mesh)
         _lifecycle(rank, world)
         _failure_propagation(rank, mesh)
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("world", [2, 4])
 def test_distributed_preprocessing(world: int) -> None:
-    with tempfile.TemporaryDirectory() as directory:
-        mp.spawn(
-            _worker,
-            args=(world, str(Path(directory) / "rendezvous")),
-            nprocs=world,
-        )
+    """Native parity, refits and collective errors hold on CPU ranks."""
+    spawn_workers(_worker, world)
 
 
 def _cuda_worker(rank: int, world: int, rendezvous: str) -> None:
-    torch.set_num_threads(1)
-    device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        "nccl",
-        rank=rank,
-        world_size=world,
-        init_method=f"file://{rendezvous}",
-    )
-    try:
+    with distributed_session(
+        rank, world, rendezvous, backend="nccl", timeout_seconds=90
+    ) as device:
         _preprocessing_parity(rank, TableMesh("mesh"), device)
         _lifecycle(rank, world, device)
         if world == 4:
@@ -495,8 +476,6 @@ def _cuda_worker(rank: int, world: int, rendezvous: str) -> None:
             parent = cast(ProcessGroup, parents[rank % 2])
             mesh = TableMesh("mesh", parent, mesh_shape=(1, 2))
             _preprocessing_parity(mesh.rank, mesh, device)
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.cuda
@@ -505,16 +484,13 @@ def _cuda_worker(rank: int, world: int, rendezvous: str) -> None:
     reason="Requires two CUDA devices",
 )
 def test_distributed_preprocessing_cuda() -> None:
+    """CUDA preprocessing and public models preserve native behavior."""
     world = int(os.environ.get("SDM_TEST_CUDA_WORLD_SIZE", "2"))
-    with tempfile.TemporaryDirectory() as directory:
-        mp.spawn(
-            _cuda_worker,
-            args=(world, str(Path(directory) / "rendezvous")),
-            nprocs=world,
-        )
+    spawn_workers(_cuda_worker, world)
 
 
 def test_preprocessing_selector_removed() -> None:
+    """Removed compatibility modes cannot be silently requested."""
     kwargs: dict[str, Any] = {"preprocessing": "replicated"}
     with pytest.raises(
         TypeError, match="unexpected keyword argument 'preprocessing'"

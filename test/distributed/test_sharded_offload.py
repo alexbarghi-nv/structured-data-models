@@ -3,17 +3,14 @@
 
 """CPU/Gloo correctness and ownership tests; no GPU/timing instrumentation."""
 
-import os
 import pickle
-import tempfile
 from dataclasses import replace
-from datetime import timedelta
 from typing import cast
+from unittest.mock import patch
 
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from sdm.cache import Cache, KVCacheEntry
 from sdm.distributed.layout import TableMesh
@@ -23,33 +20,12 @@ from sdm.models.kumo.tabular.sharded_offload import (
     ColumnCacheShard,
     ShardedColumnOffload,
 )
-
-
-def init(rank, world, path):
-    torch.set_num_threads(1)
-    dist.init_process_group(
-        "gloo",
-        init_method="file://" + path,
-        rank=rank,
-        world_size=world,
-        timeout=timedelta(seconds=45),
-    )
-    return TableMesh("mesh", mesh_shape=(world, 1))
-
-
-def run(worker, world, *args):
-    with tempfile.TemporaryDirectory() as d:
-        mp.spawn(
-            worker,
-            args=(world, os.path.join(d, "rdzv"), *args),
-            nprocs=world,
-            join=True,
-        )
+from test.distributed._runtime import distributed_session, spawn_workers
 
 
 def storage_worker(rank, world, path):
-    mesh = init(rank, world, path)
-    try:
+    with distributed_session(rank, world, path, timeout_seconds=45):
+        mesh = TableMesh("mesh", mesh_shape=(world, 1))
         owner = ShardedColumnOffload(mesh, chunk_bytes=16)
         # Nonzero offset + dense transpose, unequal K/V lengths, empty tensor,
         # nested ECOC-like caches, and fewer elements than ranks.
@@ -104,6 +80,7 @@ def storage_worker(rank, world, path):
                 )
         assert stored.size() == expected + 24
         counts = [None] * world
+        # Test-only accounting checks the sum of physical owned bytes.
         dist.all_gather_object(counts, actual)
         assert sum(counts) == original_size - 24
         for _ in range(2):
@@ -134,93 +111,112 @@ def storage_worker(rank, world, path):
         assert cache.size() == original_size
         with pytest.raises(TypeError, match="local-session"):
             pickle.dumps(stored)
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("world", [1, 2, 4, 8])
 def test_storage_partition_roundtrip(world):
-    run(storage_worker, world)
+    """Store only owned bytes and restore full cache values and strides."""
+    spawn_workers(storage_worker, world)
+
+
+def _fresh_offload(mesh):
+    """Use tiny transfer chunks to exercise multi-chunk restoration."""
+    return ShardedColumnOffload(mesh, chunk_bytes=16), Cache(
+        {
+            "row_embedding.col_block0": KVCacheEntry(
+                torch.arange(13.0).view(1, 13), torch.ones(7)
+            )
+        }
+    )
+
+
+def _check_stale_session(mesh, rank):
+    """Clearing one owner invalidates the session on every rank."""
+    owner, cache = _fresh_offload(mesh)
+    stored = owner.offload(cache, 0)
+    if rank == 0:
+        owner.clear()
+    with pytest.raises(ValueError, match="Stale"):
+        owner.restore(stored, 0, "cpu")
+    assert owner.poisoned
+
+
+def _check_mismatched_metadata(mesh, rank):
+    """Different cache shapes fail before payload transfer."""
+    owner, cache = _fresh_offload(mesh)
+    if rank == 0:
+        cache["row_embedding.col_block0"] = KVCacheEntry(
+            torch.ones(3), torch.ones(7)
+        )
+    with pytest.raises(ValueError, match="metadata/order"):
+        owner.offload(cache, 0)
+
+
+def _check_nondense_cache(mesh, rank):
+    """Strided storage with holes cannot be offloaded as dense data."""
+    owner, cache = _fresh_offload(mesh)
+    if rank == 0:
+        cache["row_embedding.col_block0"] = KVCacheEntry(
+            torch.ones(12)[::2], torch.ones(7)
+        )
+    with pytest.raises(ValueError, match="dense"):
+        owner.offload(cache, 0)
+
+
+def _check_corrupt_payload(mesh, rank):
+    """A truncated local shard fails collectively on restore."""
+    owner, cache = _fresh_offload(mesh)
+    stored = owner.offload(cache, 0)
+    if rank == 0:
+        shard = stored["row_embedding.col_block0"]
+        stored["row_embedding.col_block0"] = replace(
+            shard, payloads=(torch.ones(1), shard.payloads[1])
+        )
+    with pytest.raises(ValueError, match="payload"):
+        owner.restore(stored, 0, "cpu")
+
+
+def _check_failed_restore_ownership(mesh, rank):
+    """A failed transfer retains buffers even after clear is requested."""
+    owner, cache = _fresh_offload(mesh)
+    stored = owner.offload(cache, 0)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected transfer failure")
+
+    with (
+        patch.object(dist, "broadcast", fail),
+        pytest.raises(RuntimeError, match="injected"),
+    ):
+        owner.restore(stored, 0, "cpu")
+    assert owner.poisoned
+    assert owner._inflight
+    retained = owner._inflight[0]
+    owner.clear()
+    with pytest.raises(RuntimeError, match="fresh model/session"):
+        owner.restore(stored, 0, "cpu")
+    assert owner._inflight[0] is retained
 
 
 def failure_worker(rank, world, path):
-    mesh = init(rank, world, path)
-    try:
+    with distributed_session(rank, world, path, timeout_seconds=45):
+        mesh = TableMesh("mesh", mesh_shape=(world, 1))
 
-        def fresh():
-            return ShardedColumnOffload(mesh, chunk_bytes=16), Cache(
-                {
-                    "row_embedding.col_block0": KVCacheEntry(
-                        torch.arange(13.0).view(1, 13), torch.ones(7)
-                    )
-                }
-            )
-
-        owner, cache = fresh()
-        stored = owner.offload(cache, 0)
-        if rank == 0:
-            owner.clear()
-        with pytest.raises(ValueError, match="Stale"):
-            owner.restore(stored, 0, "cpu")
-        assert owner.poisoned
-
-        owner, cache = fresh()
-        if rank == 0:
-            cache["row_embedding.col_block0"] = KVCacheEntry(
-                torch.ones(3), torch.ones(7)
-            )
-        with pytest.raises(ValueError, match="metadata/order"):
-            owner.offload(cache, 0)
-
-        owner, cache = fresh()
-        if rank == 0:
-            cache["row_embedding.col_block0"] = KVCacheEntry(
-                torch.ones(12)[::2], torch.ones(7)
-            )
-        with pytest.raises(ValueError, match="dense"):
-            owner.offload(cache, 0)
-
-        owner, cache = fresh()
-        stored = owner.offload(cache, 0)
-        if rank == 0:
-            shard = stored["row_embedding.col_block0"]
-            stored["row_embedding.col_block0"] = replace(
-                shard, payloads=(torch.ones(1), shard.payloads[1])
-            )
-        with pytest.raises(ValueError, match="payload"):
-            owner.restore(stored, 0, "cpu")
-
-        owner, cache = fresh()
-        stored = owner.offload(cache, 0)
-        broadcast = dist.broadcast
-
-        def fail(*args, **kwargs):
-            raise RuntimeError("injected transfer failure")
-
-        dist.broadcast = fail
-        try:
-            with pytest.raises(RuntimeError, match="injected"):
-                owner.restore(stored, 0, "cpu")
-        finally:
-            dist.broadcast = broadcast
-        assert owner.poisoned
-        assert owner._inflight
-        retained = owner._inflight[0]
-        owner.clear()
-        with pytest.raises(RuntimeError, match="fresh model/session"):
-            owner.restore(stored, 0, "cpu")
-        assert owner._inflight[0] is retained
-    finally:
-        dist.destroy_process_group()
+        _check_stale_session(mesh, rank)
+        _check_mismatched_metadata(mesh, rank)
+        _check_nondense_cache(mesh, rank)
+        _check_corrupt_payload(mesh, rank)
+        _check_failed_restore_ownership(mesh, rank)
 
 
 def test_collective_failures():
-    run(failure_worker, 2)
+    """All owners reject invalid sessions, payloads and failed transfers."""
+    spawn_workers(failure_worker, 2)
 
 
 def model_worker(rank, world, path, rows):
-    mesh = init(rank, world, path)
-    try:
+    with distributed_session(rank, world, path, timeout_seconds=45):
+        mesh = TableMesh("mesh", mesh_shape=(world, 1))
         torch.manual_seed(42)
         model = _KumoTabular(
             num_classes=0,
@@ -279,10 +275,9 @@ def model_worker(rank, world, path, rows):
                     result, reference, atol=1e-6, rtol=1e-5
                 )
                 assert torch.equal(result, reference)
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize(("world", "rows"), [(1, 7), (2, 7), (4, 2)])
 def test_actual_embedding_icl_replay(world, rows):
-    run(model_worker, world, rows)
+    """Real embedding and ICL predictions survive sharded cache restore."""
+    spawn_workers(model_worker, world, rows)

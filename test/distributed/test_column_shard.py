@@ -1,25 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Rank-local column files preserve native preprocessing and predictions."""
+
 import os
-import tempfile
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from sdm import CategoricalTensor, Stype, TableTensor
 from sdm.distributed.layout import TableMesh
 from sdm.models.kumo.tabular import ColumnShard, ContextParallelKumoTabular
-from sdm.models.kumo.tabular.model import MODEL_KWARGS, KumoTabular
+from sdm.models.kumo.tabular.model import KumoTabular
 from sdm.models.kumo.tabular.prepared import PreparedInputs
 from sdm.models.kumo.tabular.recipe import default_recipe
 from sdm.processing.execution import RecipeExecution
-from test.distributed._kumo import TINY_MODEL_KWARGS
+from test.distributed._kumo import tiny_model_config
+from test.distributed._runtime import distributed_session, spawn_workers
 
 
 def _data() -> tuple[TableTensor, TableTensor, torch.Tensor]:
@@ -87,6 +87,31 @@ def _indices(width: int, rank: int) -> torch.Tensor:
     )
 
 
+def _write_expected_members(
+    directory, rank, world, contexts, queries, generator
+):
+    """Build native preprocessing references before workers start."""
+    start, end = TableMesh.bounds(61, rank // 2, world // 2)
+    expected = []
+    for original, test in zip(contexts, queries, strict=True):
+        indices = _indices(original.x.size(-1), rank)
+        mean = original.x.numerical.nanmean(-2, keepdim=True)
+        expected.append(
+            {
+                "x": original.x.numerical[start:end].index_select(-1, indices),
+                "y": original.y.numerical[start:end],
+                "mean": mean.masked_fill(mean.isnan(), 0).index_select(
+                    -1, indices
+                ),
+                "query": test.x.numerical.index_select(-1, indices),
+            }
+        )
+    torch.save(
+        {"members": expected, "generator": generator.get_state()},
+        directory / f"expected.rank{rank}.pt",
+    )
+
+
 def _write_fixture(directory: Path, world: int) -> None:
     x, query, y = _data()
     columns = dict(x.columns)
@@ -130,30 +155,10 @@ def _write_fixture(directory: Path, world: int) -> None:
             {"context": context, "query": query_shard, "targets": y},
             directory / f"input.rank{rank}.pt",
         )
-        start, end = TableMesh.bounds(61, rank // 2, world // 2)
-        expected = []
-        for original, test in zip(contexts, queries, strict=True):
-            indices = _indices(original.x.size(-1), rank)
-            mean = original.x.numerical.nanmean(-2, keepdim=True)
-            expected.append(
-                {
-                    "x": original.x.numerical[start:end].index_select(
-                        -1, indices
-                    ),
-                    "y": original.y.numerical[start:end],
-                    "mean": mean.masked_fill(mean.isnan(), 0).index_select(
-                        -1, indices
-                    ),
-                    "query": test.x.numerical.index_select(-1, indices),
-                }
-            )
-        torch.save(
-            {"members": expected, "generator": generator.get_state()},
-            directory / f"expected.rank{rank}.pt",
+        _write_expected_members(
+            directory, rank, world, contexts, queries, generator
         )
-    original_kwargs = MODEL_KWARGS["small"]
-    MODEL_KWARGS["small"] = TINY_MODEL_KWARGS
-    try:
+    with tiny_model_config():
         for task in ("regression", "classification"):
             targets = (
                 y
@@ -176,8 +181,45 @@ def _write_fixture(directory: Path, world: int) -> None:
                 },
                 directory / f"model.{task}.pt",
             )
-    finally:
-        MODEL_KWARGS["small"] = original_kwargs
+
+
+def _check_shard_model(
+    task, rank, device, context, query, y, weights, expected
+):
+    """Direct shards reproduce native first and shorter repeat predictions."""
+    targets = (
+        y if task == "regression" else torch.arange(61).reshape(-1, 1) % 12
+    )
+    model = ContextParallelKumoTabular(
+        task=task,
+        size="small",
+        pretrained=False,
+        device=device,
+        layout="mesh",
+    )
+    model.models[task].model.load_state_dict(weights)
+    model.fit(
+        context,
+        targets if rank == 0 else None,
+        recipe=default_recipe(),
+        num_estimators=8,
+        generator=torch.Generator(device=device).manual_seed(37),
+    )
+    actual = model.predict(query)
+    assert actual.columns == expected.columns
+    torch.testing.assert_close(
+        actual.numerical,
+        expected.numerical,
+        atol=2e-5,
+        rtol=2e-4,
+    )
+    small = replace(query, table=query.table[:1], row_ids=query.row_ids[:1])
+    torch.testing.assert_close(
+        model.predict(small).numerical,
+        expected.numerical[:1],
+        atol=2e-5,
+        rtol=2e-4,
+    )
 
 
 def _parity(rank: int, mesh: TableMesh, directory: Path) -> None:
@@ -225,132 +267,91 @@ def _parity(rank: int, mesh: TableMesh, directory: Path) -> None:
         8,
         torch.Generator().manual_seed(37),
     )
-    original_kwargs = MODEL_KWARGS["small"]
-    MODEL_KWARGS["small"] = TINY_MODEL_KWARGS
-    try:
+    with tiny_model_config():
         for task in ("regression", "classification"):
             reference = torch.load(
                 directory / f"model.{task}.pt", weights_only=False
             )
-            targets = (
-                data["targets"]
-                if task == "regression"
-                else torch.arange(61).reshape(-1, 1) % 12
-            )
-            model = ContextParallelKumoTabular(
-                task=task,
-                size="small",
-                pretrained=False,
-                layout="mesh",
-            )
-            model.models[task].model.load_state_dict(reference["weights"])
-            model.fit(
+            _check_shard_model(
+                task,
+                rank,
+                torch.device("cpu"),
                 context,
-                targets if rank == 0 else None,
-                recipe=default_recipe(),
-                num_estimators=8,
-                generator=torch.Generator().manual_seed(37),
+                query,
+                data["targets"],
+                reference["weights"],
+                reference["output"],
             )
-            actual = model.predict(query)
-            assert actual.columns == reference["output"].columns
-            torch.testing.assert_close(
-                actual.numerical,
-                reference["output"].numerical,
-                atol=2e-5,
-                rtol=2e-4,
-            )
-            small = replace(
-                query, table=query.table[:1], row_ids=query.row_ids[:1]
-            )
-            torch.testing.assert_close(
-                model.predict(small).numerical,
-                reference["output"].numerical[:1],
-                atol=2e-5,
-                rtol=2e-4,
-            )
-    finally:
-        MODEL_KWARGS["small"] = original_kwargs
 
 
-def _errors(rank: int, mesh: TableMesh, directory: Path) -> None:
-    data = torch.load(directory / f"input.rank{rank}.pt", weights_only=False)
-    shard, targets = data["context"], data["targets"]
-    for failure, match in (
-        ("rows", "row identities/cohort"),
-        ("schema", "global schema"),
-        ("targets", "targets differ"),
-        ("ownership", "exactly once"),
-        ("count_name", "count names collide"),
-        ("duplicates", "unique"),
-        ("missing", "Every worker"),
-    ):
-        local, y = shard, targets
-        if failure == "count_name":
+def _invalid_context_shard(shard, targets, rank, mesh, failure):
+    """Corrupt one contract while leaving other owners valid."""
+    local, y = shard, targets
+    if failure == "count_name":
+        columns = dict(shard.columns)
+        columns[Stype.numerical] = ("n0", "n1", "n2", "n3", "n4")
+        columns[Stype.categorical] = ("a", "a__count")
+        local_columns = dict(shard.table.columns)
+        local_columns[Stype.numerical] = tuple(
+            "n1" if name == "a__count" else name
+            for name in local_columns[Stype.numerical]
+        )
+        categories = list(local_columns[Stype.categorical])
+        codes = shard.table.categorical.code.clone()
+        if "b" in categories:
+            codes[..., categories.index("b")] = 0
+            categories[categories.index("b")] = "a__count"
+        local_columns[Stype.categorical] = tuple(categories)
+        table = TableTensor(
+            columns=local_columns,
+            numerical=shard.table.numerical,
+            categorical=CategoricalTensor(
+                codes, categories=shard.table.categorical.categories
+            ),
+        )
+        local = replace(shard, table=table, columns=columns)
+    elif rank == mesh.world_size - 1:
+        if failure == "rows":
+            local = replace(shard, row_ids=shard.row_ids.flip(-1))
+        elif failure == "schema":
             columns = dict(shard.columns)
-            columns[Stype.numerical] = ("n0", "n1", "n2", "n3", "n4")
-            columns[Stype.categorical] = ("a", "a__count")
-            local_columns = dict(shard.table.columns)
-            local_columns[Stype.numerical] = tuple(
-                "n1" if name == "a__count" else name
-                for name in local_columns[Stype.numerical]
+            numerical = list(columns[Stype.numerical])
+            unused = next(
+                index for index in range(5) if index not in shard.column_ids
             )
-            categories = list(local_columns[Stype.categorical])
-            codes = shard.table.categorical.code.clone()
-            if "b" in categories:
-                codes[..., categories.index("b")] = 0
-                categories[categories.index("b")] = "a__count"
-            local_columns[Stype.categorical] = tuple(categories)
+            numerical[unused] += "_wrong"
+            columns[Stype.numerical] = tuple(numerical)
+            local = replace(shard, columns=columns)
+        elif failure == "ownership":
+            duplicate = next(
+                index for index in range(5) if index not in shard.column_ids
+            )
+            ids = list(shard.column_ids)
+            ids[0] = duplicate
+            columns = dict(shard.table.columns)
+            numerical = list(columns[Stype.numerical])
+            numerical[0] = shard.columns[Stype.numerical][duplicate]
+            columns[Stype.numerical] = tuple(numerical)
             table = TableTensor(
-                columns=local_columns,
+                columns=columns,
                 numerical=shard.table.numerical,
-                categorical=CategoricalTensor(
-                    codes, categories=shard.table.categorical.categories
-                ),
+                categorical=shard.table.categorical,
             )
-            local = replace(shard, table=table, columns=columns)
-        elif rank == mesh.world_size - 1:
-            if failure == "rows":
-                local = replace(shard, row_ids=shard.row_ids.flip(-1))
-            elif failure == "schema":
-                columns = dict(shard.columns)
-                numerical = list(columns[Stype.numerical])
-                unused = next(
-                    index
-                    for index in range(5)
-                    if index not in shard.column_ids
-                )
-                numerical[unused] += "_wrong"
-                columns[Stype.numerical] = tuple(numerical)
-                local = replace(shard, columns=columns)
-            elif failure == "ownership":
-                duplicate = next(
-                    index
-                    for index in range(5)
-                    if index not in shard.column_ids
-                )
-                ids = list(shard.column_ids)
-                ids[0] = duplicate
-                columns = dict(shard.table.columns)
-                numerical = list(columns[Stype.numerical])
-                numerical[0] = shard.columns[Stype.numerical][duplicate]
-                columns[Stype.numerical] = tuple(numerical)
-                table = TableTensor(
-                    columns=columns,
-                    numerical=shard.table.numerical,
-                    categorical=shard.table.categorical,
-                )
-                local = replace(shard, table=table, column_ids=tuple(ids))
-            elif failure == "targets":
-                y = targets + 1
-            elif failure == "duplicates":
-                ids = shard.row_ids.clone()
-                ids[0] = ids[1]
-                local = replace(shard, row_ids=ids)
-            elif failure == "missing":
-                local = None
-        prepared = PreparedInputs(mesh, torch.device("cpu"), 3)
-        with pytest.raises(RuntimeError, match=match):
-            prepared.fit(local, y, default_recipe(), 1, torch.Generator())
+            local = replace(shard, table=table, column_ids=tuple(ids))
+        elif failure == "targets":
+            y = targets + 1
+        elif failure == "duplicates":
+            ids = shard.row_ids.clone()
+            ids[0] = ids[1]
+            local = replace(shard, row_ids=ids)
+        elif failure == "missing":
+            local = None
+    return local, y
+
+
+def _check_query_shard_errors(rank, mesh, data):
+    """A fitted shard keeps the same cohort, feature owners and input form."""
+    shard, targets = data["context"], data["targets"]
     prepared = PreparedInputs(mesh, torch.device("cpu"), 3)
     prepared.fit(shard, targets, default_recipe(), 1, torch.Generator())
     query = data["query"]
@@ -379,33 +380,45 @@ def _errors(rank: int, mesh: TableMesh, directory: Path) -> None:
     assert prepared.transform(data["query"])[0].x.size(-2) == 3
 
 
+def _errors(rank: int, mesh: TableMesh, directory: Path) -> None:
+    data = torch.load(directory / f"input.rank{rank}.pt", weights_only=False)
+    shard, targets = data["context"], data["targets"]
+    # One corrupt owner must make every peer fail before payload exchange.
+    for failure, match in (
+        ("rows", "row identities/cohort"),
+        ("schema", "global schema"),
+        ("targets", "targets differ"),
+        ("ownership", "exactly once"),
+        ("count_name", "count names collide"),
+        ("duplicates", "unique"),
+        ("missing", "Every worker"),
+    ):
+        local, y = _invalid_context_shard(shard, targets, rank, mesh, failure)
+        prepared = PreparedInputs(mesh, torch.device("cpu"), 3)
+        with pytest.raises(RuntimeError, match=match):
+            prepared.fit(local, y, default_recipe(), 1, torch.Generator())
+    _check_query_shard_errors(rank, mesh, data)
+
+
 def _worker(rank: int, world: int, rendezvous: str, directory: str) -> None:
-    torch.set_num_threads(1)
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"file://{rendezvous}"
-    )
-    try:
+    with distributed_session(
+        rank, world, rendezvous, backend="gloo", timeout_seconds=90
+    ):
         mesh = TableMesh("mesh")
         _parity(rank, mesh, Path(directory))
         _errors(rank, mesh, Path(directory))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("world", [2, 4])
 def test_prepartitioned_column_files(world: int, tmp_path: Path) -> None:
+    """Independent column files match native preprocessing and prediction."""
     threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
         _write_fixture(tmp_path, world)
     finally:
         torch.set_num_threads(threads)
-    with tempfile.TemporaryDirectory() as rendezvous:
-        mp.spawn(
-            _worker,
-            args=(world, str(Path(rendezvous) / "store"), str(tmp_path)),
-            nprocs=world,
-        )
+    spawn_workers(_worker, world, str(tmp_path))
 
 
 def _cuda_reference_inputs(
@@ -453,15 +466,12 @@ def _cuda_reference_model(
 def _cuda_worker(
     rank: int, world: int, rendezvous: str, directory: str
 ) -> None:
-    torch.set_num_threads(1)
-    device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        "nccl", rank=rank, world_size=world, init_method=f"file://{rendezvous}"
-    )
-    original_kwargs = MODEL_KWARGS["small"]
-    MODEL_KWARGS["small"] = TINY_MODEL_KWARGS
-    try:
+    with (
+        distributed_session(
+            rank, world, rendezvous, backend="nccl", timeout_seconds=90
+        ) as device,
+        tiny_model_config(),
+    ):
         mesh = TableMesh("mesh")
         _, contexts, queries, state = _cuda_reference_inputs(
             rank, mesh, device
@@ -501,43 +511,9 @@ def _cuda_worker(
                 Path(directory) / f"model.{task}.pt", weights_only=False
             )["weights"]
             expected = _cuda_reference_model(rank, task, device, weights)
-            targets = (
-                y
-                if task == "regression"
-                else torch.arange(61).reshape(-1, 1) % 12
+            _check_shard_model(
+                task, rank, device, context, query, y, weights, expected
             )
-            model = ContextParallelKumoTabular(
-                task=task,
-                size="small",
-                pretrained=False,
-                device=device,
-                layout="mesh",
-            )
-            model.models[task].model.load_state_dict(weights)
-            model.fit(
-                context,
-                targets if rank == 0 else None,
-                recipe=default_recipe(),
-                num_estimators=8,
-                generator=torch.Generator(device=device).manual_seed(37),
-            )
-            actual = model.predict(query)
-            assert actual.columns == expected.columns
-            torch.testing.assert_close(
-                actual.numerical, expected.numerical, atol=2e-5, rtol=2e-4
-            )
-            small = replace(
-                query, table=query.table[:1], row_ids=query.row_ids[:1]
-            )
-            torch.testing.assert_close(
-                model.predict(small).numerical,
-                expected.numerical[:1],
-                atol=2e-5,
-                rtol=2e-4,
-            )
-    finally:
-        MODEL_KWARGS["small"] = original_kwargs
-        dist.destroy_process_group()
 
 
 @pytest.mark.cuda
@@ -546,6 +522,7 @@ def _cuda_worker(
     reason="Requires two CUDA devices",
 )
 def test_prepartitioned_column_files_cuda(tmp_path: Path) -> None:
+    """NCCL column files match source-host CUDA preprocessing and models."""
     world = int(os.environ.get("SDM_TEST_CUDA_WORLD_SIZE", "2"))
     threads = torch.get_num_threads()
     torch.set_num_threads(1)
@@ -553,9 +530,4 @@ def test_prepartitioned_column_files_cuda(tmp_path: Path) -> None:
         _write_fixture(tmp_path, world)
     finally:
         torch.set_num_threads(threads)
-    with tempfile.TemporaryDirectory() as rendezvous:
-        mp.spawn(
-            _cuda_worker,
-            args=(world, str(Path(rendezvous) / "store"), str(tmp_path)),
-            nprocs=world,
-        )
+    spawn_workers(_cuda_worker, world, str(tmp_path))
