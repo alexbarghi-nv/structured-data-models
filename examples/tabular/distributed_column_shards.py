@@ -34,7 +34,7 @@ import torch
 import torch.distributed as dist
 
 import sdm
-from sdm.models.kumo.tabular import ColumnShard, DistributedKumoTabular
+from sdm.models.kumo.tabular import ColumnShard, ContextParallelKumoTabular
 
 
 def load_shard(
@@ -75,12 +75,11 @@ def main() -> None:
     torch.cuda.set_device(device)
     dist.init_process_group("nccl")
     try:
-        model = DistributedKumoTabular(
+        model = ContextParallelKumoTabular(
             task="classification",
             size="small",
             device=device,
             layout="mesh",
-            preprocessing="sharded_cuda",
         )
         model.fit(
             context,

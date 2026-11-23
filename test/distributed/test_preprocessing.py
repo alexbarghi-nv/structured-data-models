@@ -4,7 +4,7 @@
 import os
 import tempfile
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import torch
@@ -15,9 +15,9 @@ from torch.distributed import ProcessGroup
 import sdm.processing as sp
 from sdm import CategoricalTensor, Recipe, TableTensor
 from sdm.distributed.layout import TableMesh
-from sdm.models.kumo.tabular.distributed import DistributedKumoTabular
+from sdm.models.kumo.tabular.distributed import ContextParallelKumoTabular
 from sdm.models.kumo.tabular.model import MODEL_KWARGS, KumoTabular
-from sdm.models.kumo.tabular.prepared import PreparedInputs, Preprocessing
+from sdm.models.kumo.tabular.prepared import PreparedInputs
 from sdm.models.kumo.tabular.recipe import default_recipe
 from sdm.processing.execution import RecipeExecution
 
@@ -229,13 +229,12 @@ def _lifecycle(
                 generator=torch.Generator(device=device).manual_seed(37),
             )
             expected = reference.predict(query.to(device))
-            model = DistributedKumoTabular(
+            model = ContextParallelKumoTabular(
                 task=task,
                 size="small",
                 pretrained=False,
                 device=device,
                 layout="mesh",
-                preprocessing="sharded_cuda",
             )
             with pytest.raises(ValueError, match="does not support 'offload'"):
                 model.fit(
@@ -280,19 +279,6 @@ def _lifecycle(
                 model.predict(query if rank == 0 else None)
             with pytest.raises(RuntimeError, match=r"fit.*predict"):
                 model(x, y, query)
-        for removed in ("rank0_cpu", "sharded_cpu"):
-            model = DistributedKumoTabular(
-                task="regression",
-                size="small",
-                pretrained=False,
-                device=device,
-                layout="mesh",
-                preprocessing=cast(Preprocessing, removed),
-            )
-            with pytest.raises(ValueError, match="Unknown preprocessing mode"):
-                model.fit(x if rank == 0 else None, y if rank == 0 else None)
-            with pytest.raises(ValueError, match="Unknown preprocessing mode"):
-                model.predict(query if rank == 0 else None)
     finally:
         MODEL_KWARGS["small"] = original
 
@@ -452,3 +438,14 @@ def test_distributed_preprocessing_cuda() -> None:
             args=(world, str(Path(directory) / "rendezvous")),
             nprocs=world,
         )
+
+
+@pytest.mark.parametrize(
+    "mode", ["replicated", "rank0_cpu", "sharded_cpu", "sharded_cuda"]
+)
+def test_preprocessing_selector_removed(mode: str) -> None:
+    kwargs: dict[str, Any] = {"preprocessing": mode}
+    with pytest.raises(
+        TypeError, match="unexpected keyword argument 'preprocessing'"
+    ):
+        ContextParallelKumoTabular(**kwargs)

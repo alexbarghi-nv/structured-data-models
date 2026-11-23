@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, TypeVar, cast
 
 import torch
 import torch.distributed as dist
@@ -27,8 +27,6 @@ from sdm.processing.execution import (
 from sdm.tensor.table import TableSchema
 
 _T = TypeVar("_T")
-
-Preprocessing = Literal["replicated", "sharded_cuda"]
 
 
 class PreparedInputs:

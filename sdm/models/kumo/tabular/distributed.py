@@ -16,17 +16,20 @@ from sdm.distributed.layout import TableMesh
 from sdm.models.base import Callback
 from sdm.models.kumo.tabular.input import ColumnShard
 from sdm.models.kumo.tabular.model import KumoTabular, _KumoTabular
-from sdm.models.kumo.tabular.parallel import _DistributedKumoTabular
-from sdm.models.kumo.tabular.prepared import PreparedInputs, Preprocessing
+from sdm.models.kumo.tabular.parallel import _ContextParallelKumoTabular
+from sdm.models.kumo.tabular.prepared import PreparedInputs
 from sdm.models.kumo.tabular.sharded_offload import ShardedColumnOffload
 
 
-class DistributedKumoTabular(KumoTabular):
+class ContextParallelKumoTabular(KumoTabular):
     """KumoTabular inference with sharded activations and context K/V.
 
     Initialize ``torch.distributed`` first. Every rank uses the same recipe
-    and fit options. The default path replicates raw inputs and preprocessing;
-    optional preprocessing modes distribute source-host or preloaded columns.
+    and fit options. Raw columns are preprocessed on their owners' model
+    devices, then exchanged as typed tensors on the model communicator.
+    Supply host inputs on the source rank only, or a ColumnShard on every
+    rank. Only the default recipe is supported; callbacks, related tables
+    and context-only columns are unsupported.
     Call ``fit`` and ``predict`` collectively, in the same order. Weights are
     replicated and frozen, while context K/V is partitioned across ranks.
     CPU activation offload is a separate single-GPU :class:`KumoTabular` path.
@@ -42,16 +45,6 @@ class DistributedKumoTabular(KumoTabular):
             The caller owns the distributed session and destroys it after
             all models finish. Child groups are shared within this session.
         mesh_shape: Optional (row_parts,feature_parts) factors for ``"mesh"``.
-        preprocessing: ``"replicated"`` keeps native preprocessing, including
-            custom recipes, callbacks and related tables. ``"sharded_cuda"``
-            preprocesses complete raw columns on their owners' model devices
-            using the default recipe and typed transport on the model
-            communicator. Supply host inputs only on the source rank
-            (``None`` on peers), or a ``ColumnShard`` on every rank. Only owned
-            model rows and feature halos transfer to model devices. Learned
-            state uses context rows only. Sharded execution runs estimators
-            individually and offloads fitted caches to CPU when there is
-            more than one.
         query_chunk_size: Queries per attention score tile.
         key_chunk_size: Keys per attention score and K/V broadcast tile.
         batch_chunk_size: Flattened batch entries per attention tile.
@@ -60,7 +53,7 @@ class DistributedKumoTabular(KumoTabular):
             the minimum limit across the participating ranks.
         sharded_column_offload: Experimental, default-off pure-row storage of
             one column K/V shard per rank on CPU for GPU reconstruction.
-            Requires nonreplicated preprocessing and session-local caches.
+            Requires a pure-row mesh and session-local caches.
     """
 
     supports_offload: ClassVar[bool] = False
@@ -75,7 +68,6 @@ class DistributedKumoTabular(KumoTabular):
         layout: Literal["hybrid", "mesh"] = "hybrid",
         process_group: ProcessGroup | None = None,
         mesh_shape: tuple[int, int] | None = None,
-        preprocessing: Preprocessing = "replicated",
         query_chunk_size: int = 128,
         key_chunk_size: int = 256,
         batch_chunk_size: int = 16,
@@ -83,18 +75,12 @@ class DistributedKumoTabular(KumoTabular):
         sharded_column_offload: bool = False,
     ) -> None:
         mesh = TableMesh(layout, process_group, mesh_shape=mesh_shape)
-        if sharded_column_offload and (
-            mesh.feature_parts != 1 or preprocessing == "replicated"
-        ):
-            raise ValueError(
-                "Sharded column offload requires pure-row "
-                "distributed preprocessing"
-            )
+        if sharded_column_offload and mesh.feature_parts != 1:
+            raise ValueError("Sharded column offload requires a pure-row mesh")
         super().__init__(
             task=task, size=size, pretrained=pretrained, device=device
         )
         self.mesh = mesh
-        self.preprocessing = preprocessing
         self._prepared_inputs: PreparedInputs | None = None
         self._column_offload = (
             ShardedColumnOffload(mesh) if sharded_column_offload else None
@@ -114,7 +100,7 @@ class DistributedKumoTabular(KumoTabular):
             "projection_batch_size": projection_batch_size,
         }
         for name, model in tuple(self.models.items()):
-            self.models[name] = _DistributedKumoTabular(
+            self.models[name] = _ContextParallelKumoTabular(
                 cast(_KumoTabular, model),
                 mesh,
                 attention_options=attention_options,
@@ -130,45 +116,17 @@ class DistributedKumoTabular(KumoTabular):
             "embedding_feature_parts": self.mesh.feature_parts,
             "icl_context_parts": self.mesh.world_size,
             "replicated_weights": True,
-            "preprocessing": self.preprocessing,
             "source_input_rank": self.mesh.source,
         }
 
     def forward(self, *args: Any, **kwargs: Any) -> TableTensor:
-        """Use fit/predict when preprocessing is distributed."""
-        if self.preprocessing != "replicated":
-            raise RuntimeError(
-                "Distributed preprocessing uses fit() followed by predict()"
-            )
-        return super().forward(*args, **kwargs)
-
-    def fit(
-        self,
-        x: Tensor | TableTensor | ColumnShard | None,
-        y: Tensor | TableTensor | None,
-        *args: Any,
-        generator: torch.Generator | None = None,
-        offload: Literal["cpu"] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        """Fit the original recipe and replace this rank's frozen KV cache."""
-        self._validate_offload(offload, next(self.parameters()).device)
-        if self.preprocessing == "sharded_cuda":
-            self._fit_prepared(x, y, *args, generator=generator, **kwargs)
-            return
-        if self.preprocessing != "replicated":
-            raise ValueError(
-                f"Unknown preprocessing mode: {self.preprocessing!r}"
-            )
-        if isinstance(x, ColumnShard):
-            raise ValueError("ColumnShard requires sharded_cuda")
-        assert x is not None
-        assert y is not None
-        generator = self._synchronize_generator(x.device, generator)
-        super().fit(x, y, *args, generator=generator, **kwargs)
+        """Use collective fit followed by predict for context parallelism."""
+        raise RuntimeError(
+            "Context-parallel inference uses fit() followed by predict()"
+        )
 
     @torch.inference_mode()
-    def _fit_prepared(
+    def fit(
         self,
         x: Tensor | TableTensor | ColumnShard | None,
         y: Tensor | TableTensor | None,
@@ -180,11 +138,22 @@ class DistributedKumoTabular(KumoTabular):
         context_only_columns: Sequence[str] | None = None,
         callbacks: Sequence[Callback] | None = None,
         generator: torch.Generator | None = None,
+        offload: Literal["cpu"] | None = None,
         **kwargs: Any,
     ) -> None:
+        """Fit default preprocessing and cache this rank's context shards.
+
+        Supply source-host tables on the first group rank (None on peers), or
+        a ColumnShard on every rank. Estimators run individually; the inherited
+        estimator_batch_size argument does not combine them into batches.
+        Custom recipes, callbacks, related tables and context-only columns
+        are unsupported. All ranks must call fit and predict in the same order.
+        """
+        self._validate_offload(offload, next(self.parameters()).device)
         if context_only_columns:
             raise ValueError(
-                "DistributedKumoTabular does not support context-only columns"
+                "ContextParallelKumoTabular does not support "
+                "context-only columns"
             )
         if related_tables is not None or callbacks:
             raise ValueError(
@@ -196,7 +165,9 @@ class DistributedKumoTabular(KumoTabular):
         generator = self._synchronize_generator(
             device if generator is None else generator.device, generator
         )
-        model = cast(_DistributedKumoTabular, next(iter(self.models.values())))
+        model = cast(
+            _ContextParallelKumoTabular, next(iter(self.models.values()))
+        )
         prepared = PreparedInputs(
             self.mesh,
             device,
@@ -241,7 +212,7 @@ class DistributedKumoTabular(KumoTabular):
                 categorical_mask=mask,
             )
             for module in self.models.values():
-                cast(_DistributedKumoTabular, module).prepared = member
+                cast(_ContextParallelKumoTabular, module).prepared = member
             try:
                 self._forward(
                     x_context=context.x,
@@ -257,7 +228,7 @@ class DistributedKumoTabular(KumoTabular):
                 )
             finally:
                 for module in self.models.values():
-                    cast(_DistributedKumoTabular, module).prepared = None
+                    cast(_ContextParallelKumoTabular, module).prepared = None
             cache[index] = (
                 self._column_offload.offload(batch_cache, index)
                 if self._column_offload is not None
@@ -279,15 +250,6 @@ class DistributedKumoTabular(KumoTabular):
         callbacks: Sequence[Callback] | None = None,
     ) -> TableTensor:
         """Reuse fitted context and transform source-only queries."""
-        if self.preprocessing == "replicated":
-            if isinstance(x, ColumnShard):
-                raise ValueError("ColumnShard requires sharded_cuda")
-            assert x is not None
-            return super().predict(x, related_tables, callbacks=callbacks)
-        if self.preprocessing != "sharded_cuda":
-            raise ValueError(
-                f"Unknown preprocessing mode: {self.preprocessing!r}"
-            )
         if self.training:
             raise RuntimeError("predict() requires model.eval()")
         if self._cache is None or self._prepared_inputs is None:

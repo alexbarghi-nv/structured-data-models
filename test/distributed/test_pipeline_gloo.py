@@ -18,7 +18,7 @@ import sdm.models.kumo.tabular.parallel as parallel
 from sdm.cache import Cache, KVCacheEntry
 from sdm.distributed.layout import TableMesh
 from sdm.models.kumo.tabular.model import _KumoTabular
-from sdm.models.kumo.tabular.parallel import _DistributedKumoTabular
+from sdm.models.kumo.tabular.parallel import _ContextParallelKumoTabular
 from sdm.nn import InducedTransformerBlock
 
 
@@ -57,7 +57,7 @@ def worker(rank, world, path, rows):
             num_icl_heads=2,
         )
         mesh = TableMesh(layout="mesh", mesh_shape=(world, 1))
-        modes = [_DistributedKumoTabular(model, mesh) for _ in range(2)]
+        modes = [_ContextParallelKumoTabular(model, mesh) for _ in range(2)]
         for mode in modes:
             mode._fused_pure_row = True
             mode._fused_chunk_rows = 512
@@ -236,7 +236,7 @@ def test_fake_ticket_order_and_failure(monkeypatch, tmp_path):
             num_icl_layers=1,
             num_icl_heads=2,
         )
-        mode = _DistributedKumoTabular(
+        mode = _ContextParallelKumoTabular(
             model, TableMesh(layout="mesh", mesh_shape=(1, 1))
         )
         mode._fused_pure_row = True

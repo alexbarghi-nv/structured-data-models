@@ -14,7 +14,7 @@ import torch.multiprocessing as mp
 
 from sdm import CategoricalTensor, Stype, TableTensor
 from sdm.distributed.layout import TableMesh
-from sdm.models.kumo.tabular import ColumnShard, DistributedKumoTabular
+from sdm.models.kumo.tabular import ColumnShard, ContextParallelKumoTabular
 from sdm.models.kumo.tabular.model import MODEL_KWARGS, KumoTabular
 from sdm.models.kumo.tabular.prepared import PreparedInputs
 from sdm.models.kumo.tabular.recipe import default_recipe
@@ -250,12 +250,11 @@ def _parity(rank: int, mesh: TableMesh, directory: Path) -> None:
                 if task == "regression"
                 else torch.arange(61).reshape(-1, 1) % 12
             )
-            model = DistributedKumoTabular(
+            model = ContextParallelKumoTabular(
                 task=task,
                 size="small",
                 pretrained=False,
                 layout="mesh",
-                preprocessing="sharded_cuda",
             )
             model.models[task].model.load_state_dict(reference["weights"])
             model.fit(
@@ -446,13 +445,12 @@ def _cuda_reference_model(
     x, query, y = _data() if rank == 0 else (None, None, None)
     if rank == 0 and task == "classification":
         y = torch.arange(61).reshape(-1, 1) % 12
-    model = DistributedKumoTabular(
+    model = ContextParallelKumoTabular(
         task=task,
         size="small",
         pretrained=False,
         device=device,
         layout="mesh",
-        preprocessing="sharded_cuda",
     )
     model.models[task].model.load_state_dict(weights)
     model.fit(
@@ -521,13 +519,12 @@ def _cuda_worker(
                 if task == "regression"
                 else torch.arange(61).reshape(-1, 1) % 12
             )
-            model = DistributedKumoTabular(
+            model = ContextParallelKumoTabular(
                 task=task,
                 size="small",
                 pretrained=False,
                 device=device,
                 layout="mesh",
-                preprocessing="sharded_cuda",
             )
             model.models[task].model.load_state_dict(weights)
             model.fit(

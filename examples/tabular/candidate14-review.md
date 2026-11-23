@@ -1,6 +1,6 @@
 # Reviewing candidate14
 
-The public entry point is `DistributedKumoTabular`. Its default path preserves replicated preprocessing; `sharded_cuda` opts into column-owned preprocessing and typed transport. The measured pure-row configuration and private fused flags are listed in [candidate14.md](candidate14.md). Those options remain default-off.
+The public entry point is `ContextParallelKumoTabular`. It always uses column-owned preprocessing and typed transport, with no preprocessing selector. The measured pure-row configuration and private fused flags are listed in [candidate14.md](candidate14.md). Those options remain default-off.
 
 ## Read the execution path
 
@@ -25,7 +25,7 @@ Failures after submission retain the live queue or transfer buffers and poison r
 
 Seunghwa Kang's PR #1319 is included through `48a2c39a8ad59da56164b3bbc964ec1bb40a01ab`, with its commit history preserved. Native CPU activation offload uses its token buffers. Distributed column-cache sharding is a separate mechanism; distributed `fit(offload="cpu")` remains unsupported.
 
-Sharded preprocessing supports the default recipe and uses typed NCCL control and payloads without a companion Gloo group. Custom recipes use the replicated preprocessing path. CPU/Gloo tests exercise the tensor protocol. Unknown metadata structures fail before payload admission; the codec intentionally supports a limited set of table/schema/tensor/container values rather than arbitrary pickled objects.
+Sharded preprocessing supports the default recipe and uses typed NCCL control and payloads without a companion Gloo group. Custom recipes, callbacks, related tables and context-only columns are unsupported. Native `KumoTabular` remains the independent reference for recipe and model behavior. CPU/Gloo tests exercise the tensor protocol. Unknown metadata structures fail before payload admission; the codec intentionally supports a limited set of table/schema/tensor/container values rather than arbitrary pickled objects.
 
 ## Review cleanup and validation
 

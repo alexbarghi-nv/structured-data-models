@@ -2,14 +2,14 @@
 
 This snapshot includes Seunghwa Kang’s [CPU offloading and chunked row-embedding PR #1319](https://github.com/NVIDIA/structured-data-models/pull/1319), through commit `48a2c39a8ad59da56164b3bbc964ec1bb40a01ab`, with context-parallel inference adapted to its token buffers and chunked attention interfaces.
 
-Candidate14 adds typed preprocessing transport and builds on column-owned preprocessing, tiled column execution and sharded cache storage. The `sharded_cuda` mode uses the default recipe on each owner's model device and typed CUDA tensors over the existing NCCL communicator. Custom recipes use the replicated preprocessing path. CPU/Gloo tests exercise the internal tensor protocol; CUDA sharded execution does not create a companion Gloo group.
+Candidate14 adds typed preprocessing transport and builds on column-owned preprocessing, tiled column execution and sharded cache storage. `ContextParallelKumoTabular` always uses the default recipe on each owner's model device and typed CUDA tensors over the existing NCCL communicator. There is no preprocessing selector. Custom recipes, callbacks, related tables and context-only columns are unsupported; use native `KumoTabular` for custom recipes. CPU/Gloo tests exercise the internal tensor protocol; CUDA sharded execution does not create a companion Gloo group.
 
 ## Enabling the measured configuration
 
 Initialize a process group, select the local CUDA device, and construct the model collectively. The measured configuration uses a pure-row mesh, the default recipe, FP32 inference, eight estimators and these experimental options:
 
 ```python
-model = DistributedKumoTabular(
+model = ContextParallelKumoTabular(
     task="classification",
     size="large",
     device=device,
@@ -19,7 +19,6 @@ model = DistributedKumoTabular(
     key_chunk_size=2048,
     batch_chunk_size=128,
     projection_batch_size="auto",
-    preprocessing="sharded_cuda",
     sharded_column_offload=True,
 )
 for module in model.models.values():

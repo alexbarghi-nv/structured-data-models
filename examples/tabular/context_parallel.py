@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-r"""Context-parallel fit and repeated prediction with replicated preprocessing.
+r"""Context-parallel fit and repeated prediction from source-host inputs.
 
 Run on two, four or eight GPUs, for example::
 
     torchrun --standalone --nproc-per-node=4 \
         examples/tabular/context_parallel.py
 
-Every rank loads identical inputs. Weights and preprocessing are replicated;
+Only rank zero loads the raw inputs. Each GPU preprocesses its owned columns;
 row/feature activations and fitted context K/V are partitioned. All ranks call
 fit and predict in the same order, even when only rank zero uses the result.
 """
@@ -26,14 +26,18 @@ def main() -> None:
     torch.cuda.set_device(device)
     dist.init_process_group("nccl")
     try:
-        model = sdm.models.DistributedKumoTabular(
+        model = sdm.models.ContextParallelKumoTabular(
             task="regression", size="small", device=device, layout="mesh"
         )
-        context = torch.arange(128 * 8, device=device).reshape(128, 8).float()
-        query = torch.arange(16 * 8, device=device).reshape(16, 8).float()
-        targets = context[:, :1].cos()
-        model.fit(context.sin(), targets, num_estimators=2)
-        for batch in query.sin().split(8):
+        context = targets = query = None
+        if dist.get_rank() == 0:
+            context = torch.arange(128 * 8).reshape(128, 8).float()
+            query = torch.arange(16 * 8).reshape(16, 8).float().sin()
+            targets = context[:, :1].cos()
+            context = context.sin()
+        model.fit(context, targets, num_estimators=2)
+        for start in range(0, 16, 8):
+            batch = query[start : start + 8] if query is not None else None
             predictions = model.predict(batch)
             if dist.get_rank() == 0:
                 print(predictions.numerical.cpu())

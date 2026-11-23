@@ -15,8 +15,8 @@ from sdm import TableTensor
 from sdm.cache import Cache, KVCacheEntry
 from sdm.distributed.layout import TableMesh
 from sdm.models.kumo.tabular.distributed import (
-    DistributedKumoTabular,
-    _DistributedKumoTabular,
+    ContextParallelKumoTabular,
+    _ContextParallelKumoTabular,
 )
 from sdm.models.kumo.tabular.model import (
     MODEL_KWARGS,
@@ -25,7 +25,7 @@ from sdm.models.kumo.tabular.model import (
 )
 
 
-class _CheckpointKumo(DistributedKumoTabular):
+class _CheckpointKumo(ContextParallelKumoTabular):
     @torch.no_grad()
     def _load_from_pretrained(
         self,
@@ -105,7 +105,7 @@ def _worker(
                         .sin()
                         .mul(0.2)
                     )
-                distributed = _DistributedKumoTabular(
+                distributed = _ContextParallelKumoTabular(
                     model,
                     mesh,
                     attention_options={"projection_batch_size": 2}
@@ -230,7 +230,7 @@ def _public_lifecycle(
             reference = KumoTabular(
                 task=task, size="small", pretrained=False, device=device
             )
-            model = DistributedKumoTabular(
+            model = ContextParallelKumoTabular(
                 task=task,
                 size="small",
                 pretrained=False,
@@ -254,15 +254,12 @@ def _public_lifecycle(
                 reference.models[task].state_dict()
             )
             x = TableTensor.from_tensor(
-                torch.arange(18 * 5, device=device)
-                .reshape(18, 5)
-                .float()
-                .sin()
+                torch.arange(18 * 5).reshape(18, 5).float().sin()
             )
             query = TableTensor.from_tensor(
-                torch.arange(3 * 5, device=device).reshape(3, 5).float().cos()
+                torch.arange(3 * 5).reshape(3, 5).float().cos()
             )
-            targets = torch.arange(18, device=device).reshape(18, 1)
+            targets = torch.arange(18).reshape(18, 1)
             y = TableTensor.from_tensor(
                 targets % 12
                 if task == "classification"
@@ -270,28 +267,28 @@ def _public_lifecycle(
             )
             with pytest.raises(ValueError, match="does not support 'offload'"):
                 model.fit(x, y, offload="cpu")
-            with pytest.raises(ValueError, match="does not support 'offload'"):
-                model(x, y, query, offload="cpu")
+            with pytest.raises(RuntimeError, match=r"fit.*predict"):
+                model(x, y, query)
             for context_size in [18, 13]:
                 generator = torch.Generator(device=device).manual_seed(37)
                 reference.fit(
-                    x[:context_size],
-                    y[:context_size],
+                    x[:context_size].to(device),
+                    y[:context_size].to(device),
                     num_estimators=2,
                     estimator_batch_size=2,
                     generator=generator,
                 )
                 model.fit(
-                    x[:context_size],
-                    y[:context_size],
+                    x[:context_size] if dist.get_rank() == 0 else None,
+                    y[:context_size] if dist.get_rank() == 0 else None,
                     num_estimators=2,
                     estimator_batch_size=2,
                     generator=torch.Generator(device=device).manual_seed(
                         37 + dist.get_rank()
                     ),
                 )
-                expected = reference.predict(query)
-                actual = model.predict(query)
+                expected = reference.predict(query.to(device))
+                actual = model.predict(query if dist.get_rank() == 0 else None)
                 assert actual.columns == expected.columns
                 torch.testing.assert_close(
                     actual.numerical, expected.numerical, atol=2e-5, rtol=2e-4

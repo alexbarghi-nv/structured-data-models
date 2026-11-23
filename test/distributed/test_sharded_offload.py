@@ -18,7 +18,7 @@ import torch.multiprocessing as mp
 from sdm.cache import Cache, KVCacheEntry
 from sdm.distributed.layout import TableMesh
 from sdm.models.kumo.tabular.model import _KumoTabular
-from sdm.models.kumo.tabular.parallel import _DistributedKumoTabular
+from sdm.models.kumo.tabular.parallel import _ContextParallelKumoTabular
 from sdm.models.kumo.tabular.sharded_offload import (
     ColumnCacheShard,
     ShardedColumnOffload,
@@ -236,7 +236,7 @@ def model_worker(rank, world, path, rows):
             num_icl_layers=2,
             num_icl_heads=2,
         )
-        mode = _DistributedKumoTabular(model, mesh)
+        mode = _ContextParallelKumoTabular(model, mesh)
         mode._fused_pure_row = True
         mode._fused_column_pipeline = True
         mode._fused_replay_original = True

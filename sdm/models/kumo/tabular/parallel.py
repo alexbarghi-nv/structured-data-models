@@ -25,7 +25,7 @@ from sdm.models.kumo.tabular.partition import PreparedContext
 from sdm.nn import InducedTransformerBlock, TransformerBlock
 
 
-class _DistributedKumoTabular(torch.nn.Module):
+class _ContextParallelKumoTabular(torch.nn.Module):
     def __init__(
         self,
         model: _KumoTabular,

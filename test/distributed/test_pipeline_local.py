@@ -11,11 +11,11 @@ from sdm.cache import Cache
 from sdm.distributed._summary_merge import OneTicketQueue
 from sdm.distributed.layout import TableMesh
 from sdm.models.kumo.tabular.model import _KumoTabular
-from sdm.models.kumo.tabular.parallel import _DistributedKumoTabular
+from sdm.models.kumo.tabular.parallel import _ContextParallelKumoTabular
 
 
 def test_guards_and_replay_before_mutation(monkeypatch):
-    model = _DistributedKumoTabular(
+    model = _ContextParallelKumoTabular(
         cast(_KumoTabular, SimpleNamespace(row_embedding=SimpleNamespace())),
         cast(
             TableMesh,
@@ -62,7 +62,7 @@ def test_guards_and_replay_before_mutation(monkeypatch):
 
 
 def test_failure_poison_retains_live_queue(monkeypatch):
-    model = _DistributedKumoTabular(
+    model = _ContextParallelKumoTabular(
         cast(_KumoTabular, SimpleNamespace(row_embedding=SimpleNamespace())),
         cast(TableMesh, SimpleNamespace(feature_parts=1)),
     )

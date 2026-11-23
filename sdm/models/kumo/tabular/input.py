@@ -13,8 +13,8 @@ from sdm import Stype, TableTensor
 class ColumnShard:
     """One worker's complete raw columns over an agreed row cohort.
 
-    Use with ``preprocessing="sharded_cuda"``. Every
-    worker passes a shard, including workers owning no columns. Shards stay
+    Use with :class:`ContextParallelKumoTabular`. Every worker passes a
+    shard, including workers owning no columns. Shards stay
     on CPU until collective ownership checks finish. No worker needs the
     complete feature table.
 

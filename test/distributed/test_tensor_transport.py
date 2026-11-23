@@ -26,7 +26,7 @@ from sdm.distributed.tensor_control import (
     pack,
     unpack,
 )
-from sdm.models.kumo.tabular.distributed import DistributedKumoTabular
+from sdm.models.kumo.tabular.distributed import ContextParallelKumoTabular
 from sdm.models.kumo.tabular.model import MODEL_KWARGS
 from sdm.models.kumo.tabular.prepared import PreparedInputs
 from sdm.models.kumo.tabular.sharded_offload import ShardedColumnOffload
@@ -292,14 +292,13 @@ def worker(rank, world, path, backend, subgroup, model):
                         ),
                     ):
                         torch.manual_seed(42)
-                        m = DistributedKumoTabular(
+                        m = ContextParallelKumoTabular(
                             task=task,
                             size="small",
                             pretrained=False,
                             device=device,
                             layout="mesh",
                             mesh_shape=(size, 1),
-                            preprocessing="sharded_cuda",
                             sharded_column_offload=True,
                         )
                         # Constructor uses WORLD; lifecycle cases run on WORLD
