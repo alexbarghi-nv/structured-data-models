@@ -225,7 +225,11 @@ def worker(rank, world, path, backend, subgroup, integration, direct):
             for x, y, estimators in cases():
                 snapshots = []
                 for implementation in [baseline, candidate]:
+                    # The frozen pre14 reference still reads its mode selector.
                     with (
+                        patch.object(
+                            PreparedInputs, "mode", "sharded_cuda", create=True
+                        ),
                         patch.object(
                             prepared_module, "fit_sharded", implementation
                         ),
@@ -253,9 +257,7 @@ def worker(rank, world, path, backend, subgroup, integration, direct):
                             ),
                         ),
                     ):
-                        prepared = PreparedInputs(
-                            mesh, "sharded_cpu", device, 3
-                        )
+                        prepared = PreparedInputs(mesh, device, 3)
                         generator = torch.Generator(device=device).manual_seed(
                             37
                         )
@@ -308,7 +310,7 @@ def worker(rank, world, path, backend, subgroup, integration, direct):
         candidate.__globals__["encode_column_metadata"] = invalid_name
         try:
             x, y, estimators = cases()[-1]
-            prepared = PreparedInputs(mesh, "sharded_cpu", device, 3)
+            prepared = PreparedInputs(mesh, device, 3)
             with pytest.raises(RuntimeError, match="injected_unknown_column"):
                 prepared.fit(
                     x if local_rank == 0 else None,

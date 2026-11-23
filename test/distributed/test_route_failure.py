@@ -55,7 +55,7 @@ def worker(rank, rendezvous, folder, scenario):
         )
         y = torch.arange(12).reshape(12, 1).float().cos()
         query = x[:3]
-        prepared = PreparedInputs(mesh, "sharded_cpu", torch.device("cpu"), 3)
+        prepared = PreparedInputs(mesh, torch.device("cpu"), 3)
         if scenario == "fault":
             try:
                 prepared.fit(

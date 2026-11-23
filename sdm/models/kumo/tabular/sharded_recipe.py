@@ -43,8 +43,7 @@ if TYPE_CHECKING:
 def _check_recipe(recipe: Recipe) -> int:
     if repr(recipe) != repr(default_recipe()):
         raise ValueError(
-            "Sharded preprocessing requires KumoTabular.default_recipe(); "
-            "use rank0_cpu for custom recipes"
+            "Sharded preprocessing requires KumoTabular.default_recipe()"
         )
     return next(
         module.max_columns
@@ -120,11 +119,7 @@ def fit_sharded(
             else None
         )
     )
-    processing_device = (
-        prepared.device
-        if prepared.mode == "sharded_cuda"
-        else torch.device("cpu")
-    )
+    processing_device = prepared.device
 
     def process_local() -> tuple[list[TableTensor], Tensor]:
         prepared.local_route = _deterministic_route(recipe).to(
@@ -451,11 +446,7 @@ def transform_sharded(
 ) -> list[MemberQuery]:
     """Reuse local fitted column statistics and exchange query halos."""
     raw = split_inputs(prepared, x, prepared.num_estimators, fitting=False)
-    processing_device = (
-        prepared.device
-        if prepared.mode == "sharded_cuda"
-        else torch.device("cpu")
-    )
+    processing_device = prepared.device
 
     def transform_local() -> list[TableTensor]:
         on_device = raw.replace_groups(

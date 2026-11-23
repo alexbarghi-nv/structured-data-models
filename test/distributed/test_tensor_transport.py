@@ -137,7 +137,7 @@ def worker(rank, world, path, backend, subgroup, model):
             ):
                 control.broadcast(object() if rank == source else None, source)
             # Batched feature payloads, empty row destinations and NaN means.
-            prepared = PreparedInputs(mesh, "sharded_cpu", device, 1)
+            prepared = PreparedInputs(mesh, device, 1)
             rows = max(1, size - 1)
             full = (
                 torch.arange(2 * rows * 3, device=device)
@@ -259,7 +259,11 @@ def worker(rank, world, path, backend, subgroup, model):
             for task in ["regression", "classification"]:
                 outputs = []
                 for implementation in [baseline, candidate]:
+                    # The frozen pre14 reference still reads its mode selector.
                     with (
+                        patch.object(
+                            PreparedInputs, "mode", "sharded_cuda", create=True
+                        ),
                         patch.object(
                             prepared_module, "fit_sharded", implementation
                         ),
@@ -295,9 +299,7 @@ def worker(rank, world, path, backend, subgroup, model):
                             device=device,
                             layout="mesh",
                             mesh_shape=(size, 1),
-                            preprocessing="sharded_cuda"
-                            if backend == "nccl"
-                            else "sharded_cpu",
+                            preprocessing="sharded_cuda",
                             sharded_column_offload=True,
                         )
                         # Constructor uses WORLD; lifecycle cases run on WORLD

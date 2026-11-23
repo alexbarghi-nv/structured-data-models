@@ -200,49 +200,44 @@ def _parity(rank: int, mesh: TableMesh, directory: Path) -> None:
         directory / f"expected.rank{rank}.pt", weights_only=False
     )
     context, query, targets = data["context"], data["query"], data["targets"]
-    for mode in ("sharded_cpu", "sharded_cuda"):
-        prepared = PreparedInputs(mesh, mode, torch.device("cpu"), 3)
-        generator = torch.Generator().manual_seed(37)
-        members = prepared.fit(
-            context, targets, default_recipe(), 8, generator
+    prepared = PreparedInputs(mesh, torch.device("cpu"), 3)
+    generator = torch.Generator().manual_seed(37)
+    members = prepared.fit(context, targets, default_recipe(), 8, generator)
+    if rank == 0:
+        torch.testing.assert_close(
+            generator.get_state(), expected["generator"]
         )
-        if rank == 0:
+    for actual, original in zip(members, expected["members"], strict=True):
+        torch.testing.assert_close(
+            actual.context.x.numerical,
+            original["x"],
+            equal_nan=True,
+            atol=2e-6,
+            rtol=2e-6,
+        )
+        torch.testing.assert_close(actual.context.y.numerical, original["y"])
+        torch.testing.assert_close(
+            actual.mean, original["mean"], atol=2e-6, rtol=2e-6
+        )
+    for _ in range(2):
+        for actual, original in zip(
+            prepared.transform(query), expected["members"], strict=True
+        ):
             torch.testing.assert_close(
-                generator.get_state(), expected["generator"]
-            )
-        for actual, original in zip(members, expected["members"], strict=True):
-            torch.testing.assert_close(
-                actual.context.x.numerical,
-                original["x"],
+                actual.x.numerical,
+                original["query"],
                 equal_nan=True,
                 atol=2e-6,
                 rtol=2e-6,
             )
-            torch.testing.assert_close(
-                actual.context.y.numerical, original["y"]
-            )
-            torch.testing.assert_close(
-                actual.mean, original["mean"], atol=2e-6, rtol=2e-6
-            )
-        for _ in range(2):
-            for actual, original in zip(
-                prepared.transform(query), expected["members"], strict=True
-            ):
-                torch.testing.assert_close(
-                    actual.x.numerical,
-                    original["query"],
-                    equal_nan=True,
-                    atol=2e-6,
-                    rtol=2e-6,
-                )
-        # Labels may live only on an empty-feature source worker.
-        prepared.fit(
-            context,
-            targets if rank == 0 else None,
-            default_recipe(),
-            8,
-            torch.Generator().manual_seed(37),
-        )
+    # Labels may live only on an empty-feature source worker.
+    prepared.fit(
+        context,
+        targets if rank == 0 else None,
+        default_recipe(),
+        8,
+        torch.Generator().manual_seed(37),
+    )
     original_kwargs = MODEL_KWARGS["small"]
     MODEL_KWARGS["small"] = _TINY
     try:
@@ -255,39 +250,38 @@ def _parity(rank: int, mesh: TableMesh, directory: Path) -> None:
                 if task == "regression"
                 else torch.arange(61).reshape(-1, 1) % 12
             )
-            for mode in ("sharded_cpu", "sharded_cuda"):
-                model = DistributedKumoTabular(
-                    task=task,
-                    size="small",
-                    pretrained=False,
-                    layout="mesh",
-                    preprocessing=mode,
-                )
-                model.models[task].model.load_state_dict(reference["weights"])
-                model.fit(
-                    context,
-                    targets if rank == 0 else None,
-                    recipe=default_recipe(),
-                    num_estimators=8,
-                    generator=torch.Generator().manual_seed(37),
-                )
-                actual = model.predict(query)
-                assert actual.columns == reference["output"].columns
-                torch.testing.assert_close(
-                    actual.numerical,
-                    reference["output"].numerical,
-                    atol=2e-5,
-                    rtol=2e-4,
-                )
-                small = replace(
-                    query, table=query.table[:1], row_ids=query.row_ids[:1]
-                )
-                torch.testing.assert_close(
-                    model.predict(small).numerical,
-                    reference["output"].numerical[:1],
-                    atol=2e-5,
-                    rtol=2e-4,
-                )
+            model = DistributedKumoTabular(
+                task=task,
+                size="small",
+                pretrained=False,
+                layout="mesh",
+                preprocessing="sharded_cuda",
+            )
+            model.models[task].model.load_state_dict(reference["weights"])
+            model.fit(
+                context,
+                targets if rank == 0 else None,
+                recipe=default_recipe(),
+                num_estimators=8,
+                generator=torch.Generator().manual_seed(37),
+            )
+            actual = model.predict(query)
+            assert actual.columns == reference["output"].columns
+            torch.testing.assert_close(
+                actual.numerical,
+                reference["output"].numerical,
+                atol=2e-5,
+                rtol=2e-4,
+            )
+            small = replace(
+                query, table=query.table[:1], row_ids=query.row_ids[:1]
+            )
+            torch.testing.assert_close(
+                model.predict(small).numerical,
+                reference["output"].numerical[:1],
+                atol=2e-5,
+                rtol=2e-4,
+            )
     finally:
         MODEL_KWARGS["small"] = original_kwargs
 
@@ -368,10 +362,10 @@ def _errors(rank: int, mesh: TableMesh, directory: Path) -> None:
                 local = replace(shard, row_ids=ids)
             elif failure == "missing":
                 local = None
-        prepared = PreparedInputs(mesh, "sharded_cpu", torch.device("cpu"), 3)
+        prepared = PreparedInputs(mesh, torch.device("cpu"), 3)
         with pytest.raises(RuntimeError, match=match):
             prepared.fit(local, y, default_recipe(), 1, torch.Generator())
-    prepared = PreparedInputs(mesh, "sharded_cpu", torch.device("cpu"), 3)
+    prepared = PreparedInputs(mesh, torch.device("cpu"), 3)
     prepared.fit(shard, targets, default_recipe(), 1, torch.Generator())
     query = data["query"]
     if rank == mesh.world_size - 1:
@@ -436,7 +430,7 @@ def _cuda_reference_inputs(
     # The reference alone loads the complete source-host table. Its local
     # raw variables are released before workers load direct shard files.
     x, query, y = _data() if rank == 0 else (None, None, None)
-    prepared = PreparedInputs(mesh, "rank0_cpu", device, 3)
+    prepared = PreparedInputs(mesh, device, 3)
     generator = torch.Generator(device=device).manual_seed(37)
     contexts = prepared.fit(x, y, default_recipe(), 8, generator)
     queries = prepared.transform(query)
@@ -458,7 +452,7 @@ def _cuda_reference_model(
         pretrained=False,
         device=device,
         layout="mesh",
-        preprocessing="rank0_cpu",
+        preprocessing="sharded_cuda",
     )
     model.models[task].model.load_state_dict(weights)
     model.fit(
@@ -491,33 +485,32 @@ def _cuda_worker(
             Path(directory) / f"input.rank{rank}.pt", weights_only=False
         )
         context, query, y = data["context"], data["query"], data["targets"]
-        for mode in ("sharded_cpu", "sharded_cuda"):
-            prepared = PreparedInputs(mesh, mode, device, 3)
-            generator = torch.Generator(device=device).manual_seed(37)
-            actual = prepared.fit(context, y, default_recipe(), 8, generator)
-            if rank == 0:
-                torch.testing.assert_close(generator.get_state(), state)
-            for member, reference in zip(actual, contexts, strict=True):
-                torch.testing.assert_close(
-                    member.context.x.numerical,
-                    reference.context.x.numerical,
-                    equal_nan=True,
-                    atol=2e-5,
-                    rtol=2e-5,
-                )
-                torch.testing.assert_close(
-                    member.mean, reference.mean, atol=2e-5, rtol=2e-5
-                )
-            for member, reference in zip(
-                prepared.transform(query), queries, strict=True
-            ):
-                torch.testing.assert_close(
-                    member.x.numerical,
-                    reference.x.numerical,
-                    equal_nan=True,
-                    atol=2e-5,
-                    rtol=2e-5,
-                )
+        prepared = PreparedInputs(mesh, device, 3)
+        generator = torch.Generator(device=device).manual_seed(37)
+        actual = prepared.fit(context, y, default_recipe(), 8, generator)
+        if rank == 0:
+            torch.testing.assert_close(generator.get_state(), state)
+        for member, reference in zip(actual, contexts, strict=True):
+            torch.testing.assert_close(
+                member.context.x.numerical,
+                reference.context.x.numerical,
+                equal_nan=True,
+                atol=2e-5,
+                rtol=2e-5,
+            )
+            torch.testing.assert_close(
+                member.mean, reference.mean, atol=2e-5, rtol=2e-5
+            )
+        for member, reference in zip(
+            prepared.transform(query), queries, strict=True
+        ):
+            torch.testing.assert_close(
+                member.x.numerical,
+                reference.x.numerical,
+                equal_nan=True,
+                atol=2e-5,
+                rtol=2e-5,
+            )
         for task in ("regression", "classification"):
             weights = torch.load(
                 Path(directory) / f"model.{task}.pt", weights_only=False
@@ -528,37 +521,36 @@ def _cuda_worker(
                 if task == "regression"
                 else torch.arange(61).reshape(-1, 1) % 12
             )
-            for mode in ("sharded_cpu", "sharded_cuda"):
-                model = DistributedKumoTabular(
-                    task=task,
-                    size="small",
-                    pretrained=False,
-                    device=device,
-                    layout="mesh",
-                    preprocessing=mode,
-                )
-                model.models[task].model.load_state_dict(weights)
-                model.fit(
-                    context,
-                    targets if rank == 0 else None,
-                    recipe=default_recipe(),
-                    num_estimators=8,
-                    generator=torch.Generator(device=device).manual_seed(37),
-                )
-                actual = model.predict(query)
-                assert actual.columns == expected.columns
-                torch.testing.assert_close(
-                    actual.numerical, expected.numerical, atol=2e-5, rtol=2e-4
-                )
-                small = replace(
-                    query, table=query.table[:1], row_ids=query.row_ids[:1]
-                )
-                torch.testing.assert_close(
-                    model.predict(small).numerical,
-                    expected.numerical[:1],
-                    atol=2e-5,
-                    rtol=2e-4,
-                )
+            model = DistributedKumoTabular(
+                task=task,
+                size="small",
+                pretrained=False,
+                device=device,
+                layout="mesh",
+                preprocessing="sharded_cuda",
+            )
+            model.models[task].model.load_state_dict(weights)
+            model.fit(
+                context,
+                targets if rank == 0 else None,
+                recipe=default_recipe(),
+                num_estimators=8,
+                generator=torch.Generator(device=device).manual_seed(37),
+            )
+            actual = model.predict(query)
+            assert actual.columns == expected.columns
+            torch.testing.assert_close(
+                actual.numerical, expected.numerical, atol=2e-5, rtol=2e-4
+            )
+            small = replace(
+                query, table=query.table[:1], row_ids=query.row_ids[:1]
+            )
+            torch.testing.assert_close(
+                model.predict(small).numerical,
+                expected.numerical[:1],
+                atol=2e-5,
+                rtol=2e-4,
+            )
     finally:
         MODEL_KWARGS["small"] = original_kwargs
         dist.destroy_process_group()

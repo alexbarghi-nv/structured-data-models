@@ -42,18 +42,16 @@ class DistributedKumoTabular(KumoTabular):
             The caller owns the distributed session and destroys it after
             all models finish. Child groups are shared within this session.
         mesh_shape: Optional (row_parts,feature_parts) factors for ``"mesh"``.
-        preprocessing: ``"replicated"`` keeps native preprocessing. Optional
-            ``"rank0_cpu"`` fits a recipe once on the source host;
-            ``"sharded_cpu"`` and ``"sharded_cuda"`` fit complete raw columns
-            on their owners using the default recipe. Supply host inputs only
-            on the source rank (``None`` on peers), or a ``ColumnShard`` on
-            every rank for sharded modes. Only owned model rows and feature
-            halos transfer to model devices. All learned state uses context
-            rows only. Nonreplicated modes run estimators individually and
-            offload fitted caches to CPU when there is more than one.
-            Sharded modes use typed transport on the model communicator;
-            rank0_cpu uses Gloo. Callbacks and related tables
-            require the replicated path.
+        preprocessing: ``"replicated"`` keeps native preprocessing, including
+            custom recipes, callbacks and related tables. ``"sharded_cuda"``
+            preprocesses complete raw columns on their owners' model devices
+            using the default recipe and typed transport on the model
+            communicator. Supply host inputs only on the source rank
+            (``None`` on peers), or a ``ColumnShard`` on every rank. Only owned
+            model rows and feature halos transfer to model devices. Learned
+            state uses context rows only. Sharded execution runs estimators
+            individually and offloads fitted caches to CPU when there is
+            more than one.
         query_chunk_size: Queries per attention score tile.
         key_chunk_size: Keys per attention score and K/V broadcast tile.
         batch_chunk_size: Flattened batch entries per attention tile.
@@ -155,13 +153,15 @@ class DistributedKumoTabular(KumoTabular):
     ) -> None:
         """Fit the original recipe and replace this rank's frozen KV cache."""
         self._validate_offload(offload, next(self.parameters()).device)
-        if self.preprocessing != "replicated":
+        if self.preprocessing == "sharded_cuda":
             self._fit_prepared(x, y, *args, generator=generator, **kwargs)
             return
-        if isinstance(x, ColumnShard):
+        if self.preprocessing != "replicated":
             raise ValueError(
-                "ColumnShard requires sharded_cpu or sharded_cuda"
+                f"Unknown preprocessing mode: {self.preprocessing!r}"
             )
+        if isinstance(x, ColumnShard):
+            raise ValueError("ColumnShard requires sharded_cuda")
         assert x is not None
         assert y is not None
         generator = self._synchronize_generator(x.device, generator)
@@ -199,7 +199,6 @@ class DistributedKumoTabular(KumoTabular):
         model = cast(_DistributedKumoTabular, next(iter(self.models.values())))
         prepared = PreparedInputs(
             self.mesh,
-            self.preprocessing,
             device,
             model.model.row_embedding.cell_embedding.group_size,
         )
@@ -279,14 +278,16 @@ class DistributedKumoTabular(KumoTabular):
         *,
         callbacks: Sequence[Callback] | None = None,
     ) -> TableTensor:
-        """Reuse context state; new modes accept source-only host queries."""
+        """Reuse fitted context and transform source-only queries."""
         if self.preprocessing == "replicated":
             if isinstance(x, ColumnShard):
-                raise ValueError(
-                    "ColumnShard requires sharded_cpu or sharded_cuda"
-                )
+                raise ValueError("ColumnShard requires sharded_cuda")
             assert x is not None
             return super().predict(x, related_tables, callbacks=callbacks)
+        if self.preprocessing != "sharded_cuda":
+            raise ValueError(
+                f"Unknown preprocessing mode: {self.preprocessing!r}"
+            )
         if self.training:
             raise RuntimeError("predict() requires model.eval()")
         if self._cache is None or self._prepared_inputs is None:

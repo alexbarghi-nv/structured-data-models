@@ -63,11 +63,6 @@ def load_shard(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
-    parser.add_argument(
-        "--preprocessing",
-        choices=("sharded_cpu", "sharded_cuda"),
-        default="sharded_cpu",
-    )
     args = parser.parse_args()
     rank = int(os.environ["RANK"])
     # Each worker opens only its own context and query data files.
@@ -85,7 +80,7 @@ def main() -> None:
             size="small",
             device=device,
             layout="mesh",
-            preprocessing=args.preprocessing,
+            preprocessing="sharded_cuda",
         )
         model.fit(
             context,

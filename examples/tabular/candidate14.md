@@ -2,7 +2,7 @@
 
 This snapshot includes Seunghwa Kang’s [CPU offloading and chunked row-embedding PR #1319](https://github.com/NVIDIA/structured-data-models/pull/1319), through commit `48a2c39a8ad59da56164b3bbc964ec1bb40a01ab`, with context-parallel inference adapted to its token buffers and chunked attention interfaces.
 
-Candidate14 adds typed preprocessing transport and builds on column-owned preprocessing, tiled column execution and sharded cache storage. On an NCCL mesh, `sharded_cuda` and `sharded_cpu` use typed CUDA tensors for control and feature exchange; they do not create a companion Gloo group. The legacy `rank0_cpu` custom-recipe path retains object/Gloo transport, and CPU distributed tests use Gloo. The older constructor docstring’s blanket Gloo requirement does not apply to the sharded NCCL paths.
+Candidate14 adds typed preprocessing transport and builds on column-owned preprocessing, tiled column execution and sharded cache storage. The `sharded_cuda` mode uses the default recipe on each owner's model device and typed CUDA tensors over the existing NCCL communicator. Custom recipes use the replicated preprocessing path. CPU/Gloo tests exercise the internal tensor protocol; CUDA sharded execution does not create a companion Gloo group.
 
 ## Enabling the measured configuration
 

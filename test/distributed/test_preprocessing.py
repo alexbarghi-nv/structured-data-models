@@ -21,12 +21,6 @@ from sdm.models.kumo.tabular.prepared import PreparedInputs, Preprocessing
 from sdm.models.kumo.tabular.recipe import default_recipe
 from sdm.processing.execution import RecipeExecution
 
-_MODES: tuple[Preprocessing, ...] = (
-    "rank0_cpu",
-    "sharded_cpu",
-    "sharded_cuda",
-)
-
 
 def _cases() -> list[
     tuple[TableTensor, TableTensor, torch.Tensor, int | None, int]
@@ -116,64 +110,63 @@ def _preprocessing_parity(
             generator=reference_generator,
         )
         expected_queries = reference.transform(query.to(device), None)
-        for mode in _MODES:
-            prepared = PreparedInputs(mesh, mode, device, 3)
-            generator = torch.Generator(device=device).manual_seed(37)
-            actual = prepared.fit(
-                x if rank == 0 else None,
-                y if rank == 0 else None,
-                default_recipe(),
-                estimators,
-                generator,
+        prepared = PreparedInputs(mesh, device, 3)
+        generator = torch.Generator(device=device).manual_seed(37)
+        actual = prepared.fit(
+            x if rank == 0 else None,
+            y if rank == 0 else None,
+            default_recipe(),
+            estimators,
+            generator,
+        )
+        if rank == 0:
+            torch.testing.assert_close(
+                generator.get_state(), reference_generator.get_state()
             )
-            if rank == 0:
-                torch.testing.assert_close(
-                    generator.get_state(), reference_generator.get_state()
+        start, end = mesh.rows(x.size(-2))
+        for member, original in zip(actual, expected, strict=True):
+            if max_columns == 500:
+                assert member.feature_count == max_columns
+            selected = (
+                original.x.numerical[..., start:end, :]
+                .index_select(
+                    -1,
+                    member.feature_indices.to(device),
                 )
-            start, end = mesh.rows(x.size(-2))
-            for member, original in zip(actual, expected, strict=True):
-                if max_columns == 500:
-                    assert member.feature_count == max_columns
-                selected = (
-                    original.x.numerical[..., start:end, :]
-                    .index_select(
-                        -1,
-                        member.feature_indices.to(device),
-                    )
-                    .cpu()
-                )
+                .cpu()
+            )
+            torch.testing.assert_close(
+                member.context.x.numerical,
+                selected,
+                equal_nan=True,
+                atol=tolerance,
+                rtol=tolerance,
+            )
+            torch.testing.assert_close(
+                member.context.y.numerical,
+                original.y.numerical[..., start:end, :].cpu(),
+            )
+            torch.testing.assert_close(
+                member.context.y.categorical.code,
+                original.y.categorical.code[..., start:end, :].cpu(),
+            )
+        for _ in range(2):
+            queries = prepared.transform(query if rank == 0 else None)
+            for member, original, context in zip(
+                queries,
+                expected_queries,
+                actual,
+                strict=True,
+            ):
                 torch.testing.assert_close(
-                    member.context.x.numerical,
-                    selected,
+                    member.x.numerical,
+                    original.x.numerical.index_select(
+                        -1, context.feature_indices.to(device)
+                    ).cpu(),
                     equal_nan=True,
                     atol=tolerance,
                     rtol=tolerance,
                 )
-                torch.testing.assert_close(
-                    member.context.y.numerical,
-                    original.y.numerical[..., start:end, :].cpu(),
-                )
-                torch.testing.assert_close(
-                    member.context.y.categorical.code,
-                    original.y.categorical.code[..., start:end, :].cpu(),
-                )
-            for _ in range(2):
-                queries = prepared.transform(query if rank == 0 else None)
-                for member, original, context in zip(
-                    queries,
-                    expected_queries,
-                    actual,
-                    strict=True,
-                ):
-                    torch.testing.assert_close(
-                        member.x.numerical,
-                        original.x.numerical.index_select(
-                            -1, context.feature_indices.to(device)
-                        ).cpu(),
-                        equal_nan=True,
-                        atol=tolerance,
-                        rtol=tolerance,
-                    )
 
 
 def _lifecycle(
@@ -236,150 +229,86 @@ def _lifecycle(
                 generator=torch.Generator(device=device).manual_seed(37),
             )
             expected = reference.predict(query.to(device))
-            for mode in _MODES:
-                model = DistributedKumoTabular(
-                    task=task,
-                    size="small",
-                    pretrained=False,
-                    device=device,
-                    layout="mesh",
-                    preprocessing=mode,
-                )
-                with pytest.raises(
-                    ValueError, match="does not support 'offload'"
-                ):
-                    model.fit(
-                        x if rank == 0 else None,
-                        y if rank == 0 else None,
-                        offload="cpu",
-                    )
-                with pytest.raises(ValueError, match="context-only"):
-                    model.fit(
-                        x if rank == 0 else None,
-                        y if rank == 0 else None,
-                        context_only_columns=["x0"],
-                    )
-                model.models[task].model.load_state_dict(
-                    reference.models[task].state_dict()
-                )
-                for _ in range(2):
-                    model.fit(
-                        x if rank == 0 else None,
-                        y if rank == 0 else None,
-                        num_estimators=8,
-                        estimator_batch_size=2,
-                        generator=torch.Generator(device=device).manual_seed(
-                            37
-                        ),
-                    )
-                    actual = model.predict(query if rank == 0 else None)
-                    assert actual.columns == expected.columns
-                    torch.testing.assert_close(
-                        actual.numerical,
-                        expected.numerical,
-                        atol=2e-5,
-                        rtol=2e-4,
-                    )
-                    repeat = model.predict(query[:1] if rank == 0 else None)
-                    torch.testing.assert_close(
-                        repeat.numerical,
-                        expected.numerical[:1],
-                        atol=2e-5,
-                        rtol=2e-4,
-                    )
-                model.clear()
-                with pytest.raises(RuntimeError, match="Call fit"):
-                    model.predict(query if rank == 0 else None)
-                with pytest.raises(RuntimeError, match=r"fit.*predict"):
-                    model(x, y, query)
-            if task == "regression":
-                recipe = Recipe(
-                    features=sp.Standardize(),
-                    output=sp.AverageEstimators(),
-                )
-                reference.fit(x.to(device), y.to(device), recipe=recipe)
-                model = DistributedKumoTabular(
-                    task=task,
-                    size="small",
-                    pretrained=False,
-                    device=device,
-                    layout="mesh",
-                    preprocessing="rank0_cpu",
-                )
-                model.models[task].model.load_state_dict(
-                    reference.models[task].state_dict()
-                )
+            model = DistributedKumoTabular(
+                task=task,
+                size="small",
+                pretrained=False,
+                device=device,
+                layout="mesh",
+                preprocessing="sharded_cuda",
+            )
+            with pytest.raises(ValueError, match="does not support 'offload'"):
                 model.fit(
                     x if rank == 0 else None,
                     y if rank == 0 else None,
-                    recipe=recipe,
+                    offload="cpu",
+                )
+            with pytest.raises(ValueError, match="context-only"):
+                model.fit(
+                    x if rank == 0 else None,
+                    y if rank == 0 else None,
+                    context_only_columns=["x0"],
+                )
+            model.models[task].model.load_state_dict(
+                reference.models[task].state_dict()
+            )
+            for _ in range(2):
+                model.fit(
+                    x if rank == 0 else None,
+                    y if rank == 0 else None,
+                    num_estimators=8,
+                    estimator_batch_size=2,
+                    generator=torch.Generator(device=device).manual_seed(37),
                 )
                 actual = model.predict(query if rank == 0 else None)
-                expected = reference.predict(query.to(device))
-                assert actual.numerical.dtype == torch.float32
+                assert actual.columns == expected.columns
                 torch.testing.assert_close(
                     actual.numerical,
                     expected.numerical,
                     atol=2e-5,
                     rtol=2e-4,
                 )
-                reference.fit(
-                    x.to(device),
-                    y.to(device),
-                    num_estimators=1,
-                    generator=torch.Generator(device=device).manual_seed(43),
+                repeat = model.predict(query[:1] if rank == 0 else None)
+                torch.testing.assert_close(
+                    repeat.numerical,
+                    expected.numerical[:1],
+                    atol=2e-5,
+                    rtol=2e-4,
                 )
-                expected = reference.predict(query.to(device))
+            model.clear()
+            with pytest.raises(RuntimeError, match="Call fit"):
+                model.predict(query if rank == 0 else None)
+            with pytest.raises(RuntimeError, match=r"fit.*predict"):
+                model(x, y, query)
+        for removed in ("rank0_cpu", "sharded_cpu"):
+            model = DistributedKumoTabular(
+                task="regression",
+                size="small",
+                pretrained=False,
+                device=device,
+                layout="mesh",
+                preprocessing=cast(Preprocessing, removed),
+            )
+            with pytest.raises(ValueError, match="Unknown preprocessing mode"):
+                model.fit(x if rank == 0 else None, y if rank == 0 else None)
+            with pytest.raises(ValueError, match="Unknown preprocessing mode"):
+                model.predict(query if rank == 0 else None)
     finally:
         MODEL_KWARGS["small"] = original
-
-
-def _fail_partition(*args: object, **kwargs: object) -> None:
-    raise ValueError("partition failed")
 
 
 def _failure_propagation(rank: int, mesh: TableMesh) -> None:
     x = torch.arange(12).reshape(3, 4).float()
     y = torch.arange(3).reshape(-1, 1).float()
-    for mode in ("sharded_cpu", "sharded_cuda"):
-        prepared = PreparedInputs(mesh, mode, torch.device("cpu"), 3)
-        with pytest.raises(RuntimeError, match="default_recipe"):
-            prepared.fit(
-                x if rank == 0 else None,
-                y if rank == 0 else None,
-                Recipe(features=sp.Standardize()),
-                1,
-                torch.Generator(),
-            )
-    custom = PreparedInputs(mesh, "rank0_cpu", torch.device("cpu"), 3)
-    contexts = custom.fit(
-        x if rank == 0 else None,
-        y if rank == 0 else None,
-        Recipe(features=sp.Standardize()),
-        1,
-        torch.Generator(),
-    )
-    expected = sp.Standardize().fit_transform(TableTensor.from_tensor(x))
-    start, end = mesh.rows(x.size(0))
-    torch.testing.assert_close(
-        contexts[0].context.x.numerical,
-        expected.numerical[start:end].index_select(
-            -1, contexts[0].feature_indices
-        ),
-    )
-    failing = PreparedInputs(mesh, "rank0_cpu", torch.device("cpu"), 3)
-    with pytest.MonkeyPatch.context() as patch:
-        if rank == 0:
-            patch.setattr(failing, "partition", _fail_partition)
-        with pytest.raises(RuntimeError, match="partition failed"):
-            failing.fit(
-                x if rank == 0 else None,
-                y if rank == 0 else None,
-                default_recipe(),
-                1,
-                torch.Generator(),
-            )
-    prepared = PreparedInputs(mesh, "rank0_cpu", torch.device("cpu"), 3)
+    prepared = PreparedInputs(mesh, torch.device("cpu"), 3)
+    with pytest.raises(RuntimeError, match="default_recipe"):
+        prepared.fit(
+            x if rank == 0 else None,
+            y if rank == 0 else None,
+            Recipe(features=sp.Standardize()),
+            1,
+            torch.Generator(),
+        )
     prepared.fit(
         x if rank == 0 else None,
         y if rank == 0 else None,
@@ -412,32 +341,31 @@ def _subgroup_worker(rank: int, world: int, rendezvous: str) -> None:
             source = rank % 2
             x = torch.arange(24).reshape(6, 4).float().sin() + source
             y = torch.arange(6).reshape(-1, 1).float()
-            for mode in ("rank0_cpu", "sharded_cpu"):
-                prepared = PreparedInputs(mesh, mode, torch.device("cpu"), 3)
-                members = prepared.fit(
-                    x if rank == source else None,
-                    y if rank == source else None,
-                    default_recipe(),
-                    1,
-                    torch.Generator().manual_seed(31),
-                )
-                expected = RecipeExecution(default_recipe()).fit_transform(
-                    TableTensor.from_tensor(x),
-                    TableTensor.from_tensor(y),
-                    None,
-                    num_members=1,
-                    generator=torch.Generator().manual_seed(31),
-                )[0]
-                start, end = mesh.rows(len(x))
-                torch.testing.assert_close(
-                    members[0].context.x.numerical,
-                    expected.x.numerical[start:end].index_select(
-                        -1, members[0].feature_indices
-                    ),
-                )
-                queries = prepared.transform(x[:2] if rank == source else None)
-                assert len(queries) == 1
-                prior.append(prepared)
+            prepared = PreparedInputs(mesh, torch.device("cpu"), 3)
+            members = prepared.fit(
+                x if rank == source else None,
+                y if rank == source else None,
+                default_recipe(),
+                1,
+                torch.Generator().manual_seed(31),
+            )
+            expected = RecipeExecution(default_recipe()).fit_transform(
+                TableTensor.from_tensor(x),
+                TableTensor.from_tensor(y),
+                None,
+                num_members=1,
+                generator=torch.Generator().manual_seed(31),
+            )[0]
+            start, end = mesh.rows(len(x))
+            torch.testing.assert_close(
+                members[0].context.x.numerical,
+                expected.x.numerical[start:end].index_select(
+                    -1, members[0].feature_indices
+                ),
+            )
+            queries = prepared.transform(x[:2] if rank == source else None)
+            assert len(queries) == 1
+            prior.append(prepared)
             groups = dist.get_pg_count()
             for _ in range(32):
                 current = TableMesh("mesh", parent, mesh_shape=(2, 1))
