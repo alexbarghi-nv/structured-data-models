@@ -106,6 +106,8 @@ find-links = ["https://data.pyg.org/whl/torch-2.14.0+cpu.html"]
 exclude-newer = "1 day"
 
 [tool.pytest.ini_options]
+# Spawned distributed workers import test modules through the repository root.
+pythonpath = ["."]
 addopts = [
     "--capture=no",
     "--color=yes",

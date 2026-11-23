@@ -13,9 +13,13 @@ from sdm.nn import QueryScaling, RMSNorm, RotaryEmbedding, TransformerBlock
 
 
 class _RoPERMSNorm(Sequential):
-    def forward(self, input: Tensor) -> Tensor:  # noqa: A002
+    def forward(
+        self,
+        input: Tensor,  # noqa: A002
+        pos: Tensor | None = None,
+    ) -> Tensor:
         rope, norm = self
-        return norm(input, rope=rope)
+        return norm(input, rope=rope, pos=pos)
 
 
 class KumoTabularTransformerBlock(TransformerBlock):
